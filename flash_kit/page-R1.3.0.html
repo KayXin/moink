@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="moink-page-version" content="R1.2.2">
+<meta name="moink-page-version" content="R1.3.0">
 <title>墨印 · MoInk</title>
 <style>
 /* ===== Cropper.js v1.6.2 | MIT | https://github.com/fengyuanchen/cropperjs ===== */
@@ -176,12 +176,35 @@ details summary{ cursor:pointer; font-weight:600; font-size:14px; color:var(--in
 .slider{ display:flex; align-items:center; gap:10px; margin:6px 0; }
 .slider label{ font-size:12.5px; color:var(--mut); width:78px; flex-shrink:0; }
 .slider output{ font-size:12px; color:var(--mut); width:44px; text-align:right; }
-.dmark{ display:inline-block; margin-left:6px; font-size:11px; color:var(--acc2); }
+.dmark{ display:inline-block; margin-left:6px; font-size:11px; color:var(--acc2);
+  cursor:pointer; padding:0 3px; border-radius:3px; user-select:none; }
+.dmark:hover{ background:rgba(0,0,0,.06); }
 .dmark.off{ visibility:hidden; }
 @media (max-width:480px){ .slider label{ width:66px; } }
+.galGrid{ display:grid; grid-template-columns:repeat(8,1fr); gap:6px; margin:10px 0; }
+.galCell{ position:relative; background:#f3efe6; border:1px solid #ddd; border-radius:4px;
+  overflow:hidden; aspect-ratio:138/192; cursor:pointer; }
+.galCell canvas{ width:100%; height:100%; display:block; image-rendering:pixelated; }
+.galCell img{ width:100%; height:100%; display:block; object-fit:cover; }
+.galCell.cur{ outline:2px solid var(--ok,#2e8b57); outline-offset:1px; }
+.galDel{ position:absolute; top:1px; right:1px; width:14px; height:14px;
+  display:flex; align-items:center; justify-content:center;
+  padding:0; margin:0; line-height:1; border:0; border-radius:50%;
+  box-sizing:border-box; background:rgba(0,0,0,.55); color:#fff;
+  font-size:10px; cursor:pointer; }
+.galEmpty{ display:flex; align-items:center; justify-content:center; color:#c4bda9;
+  font-size:10px; border:1px dashed #d5ceba; border-radius:4px; aspect-ratio:138/192; }
+#prevOverlay{ position:fixed; inset:0; background:rgba(0,0,0,.85); z-index:99;
+  display:flex; flex-direction:column; align-items:center; justify-content:center; gap:12px; }
+#prevCanvas{ max-width:92vw; max-height:78vh; background:#fff; border-radius:4px; }
 </style>
 </head>
 <body>
+<!-- R1.3.1 大图预览层：必须在所有 <script> 之前，图库 JS 顶层绑定 $("prevClose")/$("prevOverlay") 依赖它先存在 -->
+<div id="prevOverlay" style="display:none">
+  <canvas id="prevCanvas"></canvas>
+  <button class="mini" id="prevClose">关闭预览</button>
+</div>
 
 <div id="workLoading" aria-hidden="true">
   <div class="box" role="status" aria-live="polite"><span class="spin"></span><span id="workLoadingText">正在处理…</span></div>
@@ -339,10 +362,25 @@ details summary{ cursor:pointer; font-weight:600; font-size:14px; color:var(--in
   </div><div id="editRight">
     <div id="prevWrap"><canvas id="prev" width="552" height="768"></canvas><div id="objLayer"></div></div>
     <div id="stathint"></div>
-    <button class="sec" id="go" style="width:100%" disabled>上传并刷新屏幕</button>
+    <div class="row">
+      <button class="sec" id="goOnly" disabled style="background:#1e6fd9;color:#fff;border-color:#1e6fd9;flex:1;min-width:0">仅上传</button>
+      <button class="sec" id="go" disabled style="flex:1;min-width:0">上传并刷新屏幕</button>
+    </div>
     <div id="bar"><div id="fill"></div></div>
     <p id="msg"></p>
   </div></div>
+  </section>
+
+  <!-- ================= 轮播图库（R1.3.1） ================= -->
+  <section class="card" id="galleryCard">
+    <h3>设备轮播图库<span class="tag">最多 8 张</span></h3>
+    <div class="hint">用上方「上传并刷新屏幕」添加轮播图，可先编辑再上传；满 8 张后需先删除或清空。
+      点击缩略图看大图，点 × 删除该张。<b>短按设备按键</b>循环切换（长按 5 秒恢复出厂）。</div>
+    <div class="galGrid" id="galGrid"></div>
+    <div class="row">
+      <button class="mini" id="carouselClear">清空轮播</button>
+      <span class="savestate" id="caromsg"></span>
+    </div>
   </section>
 
 
@@ -1175,8 +1213,79 @@ function packIdx(idx){
   }
   return out;
 }
+/* 通用几何打包（缩略图用）：契约同 packIdx，几何由参数给出 */
+function packIdxGeom(idx, W, H){
+  var RB = W >> 2;
+  var out = new Uint8Array(RB*H);
+  for (var r = 0; r < H; r++){
+    var ro = (H - 1 - r) * W, bo = r * RB;
+    for (var xb = 0; xb < RB; xb++){
+      var xa = W - 4 - (xb << 2);
+      out[bo + xb] = (idx[ro+xa+3] << 6) | (idx[ro+xa+2] << 4) |
+                     (idx[ro+xa+1] << 2) | idx[ro+xa];
+    }
+  }
+  return out;
+}
 function packFull(){
   return packIdx(rotateCW(renderComposite(EW, EH), EW, EH));
+}
+/* R1.3.6：缩略图直接在缩略尺寸（EW/8 × EH/8 = 69x96）上合成——裁剪、
+   warmMap、文字全部在小画布完成，不再全尺寸合成再降采样。
+   计算量降 ~64 倍（42万像素 → ~6.6千像素），JPEG 缩到 ~2-3KB，
+   上传/存储/图库传输同步变快。UI 已是 8 列小格子，69x96 足够清晰。 */
+function composeThumbRgb(){
+  var tw = Math.max(1, Math.round(EW/8)), th = Math.max(1, Math.round(EH/8));
+  var cv = document.createElement("canvas");
+  cv.width = tw; cv.height = th;
+  var ctx = cv.getContext("2d", { willReadFrequently: true });
+  if (MODE === 0){
+    ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, tw, th);
+    if (img && cr && crReady){
+      var r0 = contentRect();
+      var r = { x:Math.round(r0.x*tw/EW), y:Math.round(r0.y*th/EH),
+                w:Math.max(1, Math.round(r0.w*tw/EW)),
+                h:Math.max(1, Math.round(r0.h*th/EH)) };
+      var cc = getCropCanvas(r.w, r.h);
+      if (cc && cc.width && cc.height){
+        var mapped = warmMap(toBuf(cc), r.w, r.h, cfg);   /* 彩色风格化，不量化 */
+        var im = ctx.createImageData(r.w, r.h), dd = im.data;
+        for (var i = 0; i < r.w*r.h; i++){
+          dd[i*4] = clamp(mapped[i*3], 0, 255);
+          dd[i*4+1] = clamp(mapped[i*3+1], 0, 255);
+          dd[i*4+2] = clamp(mapped[i*3+2], 0, 255);
+          dd[i*4+3] = 255;
+        }
+        ctx.putImageData(im, r.x, r.y);
+      }
+    }
+  } else {
+    var nbp = PAL[[C_W, C_K, C_Y, C_R][clamp(+cfg.textBg|0, 0, 3)]];
+    ctx.fillStyle = "rgb(" + nbp[0] + "," + nbp[1] + "," + nbp[2] + ")";
+    ctx.fillRect(0, 0, tw, th);
+  }
+  var objs = (MODE === 0) ? (cfg.textOn ? cfg.objsImg : []) : cfg.objsNote;
+  drawObjs(ctx, objs, tw, th);
+  return cv;
+}
+function buildThumbJpeg(){
+  var cv = composeThumbRgb();   /* 已是 69x96 小画布，直接编码 */
+  var tw = cv.width, th = cv.height;
+  var b64 = cv.toDataURL("image/jpeg", 0.72).split(",")[1];
+  var bin = atob(b64);
+  var body = new Uint8Array(bin.length);
+  for (var i = 0; i < bin.length; i++) body[i] = bin.charCodeAt(i);
+  var hdr = new Uint8Array(16);
+  var L = body.length;
+  hdr[0] = 0xA5; hdr[1] = 0x5A; hdr[2] = 2; hdr[3] = 0;   /* fmt=2: 彩色 JPEG */
+  hdr[4] = (tw >> 8) & 0xFF; hdr[5] = tw & 0xFF;
+  hdr[6] = (th >> 8) & 0xFF; hdr[7] = th & 0xFF;
+  hdr[8] = (L >>> 24) & 0xFF; hdr[9] = (L >>> 16) & 0xFF;
+  hdr[10] = (L >>> 8) & 0xFF; hdr[11] = L & 0xFF;
+  hdr[12] = 0; hdr[13] = 0; hdr[14] = 0; hdr[15] = 0;
+  var out = new Uint8Array(16 + L);
+  out.set(hdr, 0); out.set(body, 16);
+  return out;
 }
 
 /* ==================================================================
@@ -1216,7 +1325,7 @@ var $ = function(id){ return document.getElementById(id); };
 var fileEl = $("file"), coreEl = $("core"), dmodeEl = $("dmode");
 var levelsEl = $("levels"), spaceEl = $("space");
 var cropImgEl = $("cropImg"), objLayerEl = $("objLayer"), prevWrapEl = $("prevWrap");
-var prevEl = $("prev"), goEl = $("go"), msgEl = $("msg");
+var prevEl = $("prev"), goEl = $("go"), goOnlyEl = $("goOnly"), msgEl = $("msg");
 var barEl = $("bar"), fillEl = $("fill"), statHintEl = $("stathint");
 var dropEl = $("drop"), txtEl = $("txt");
 var workLoadingEl = $("workLoading"), workLoadingTextEl = $("workLoadingText");
@@ -1345,11 +1454,13 @@ function runPreview(){
     statHintEl.textContent = fast ? "正在生成预览…" : "";
     previewOK = true;
     goEl.disabled = (MODE === 0) ? (!img || !previewOK) : false;
+    goOnlyEl.disabled = goEl.disabled;
     if (!fast) msg("预览完成，可以上传了", "");
   } catch (e){
     previewOK = false;
     statHintEl.textContent = "预览失败：" + e.message;
     if (MODE === 0) goEl.disabled = true;
+    goOnlyEl.disabled = goEl.disabled;
     if (!fast) msg("预览失败：" + e.message + "，请重试", "err");
   }
   previewBusy = false;
@@ -1393,6 +1504,7 @@ function setMode(m, silent){
   refreshTextUI();
   syncSel();
   goEl.disabled = imageMode ? !img : false;
+  goOnlyEl.disabled = goEl.disabled;
   cfg.lastMode = MODE;
   saveCfg();
   schedulePreview(false);
@@ -1539,6 +1651,7 @@ function adoptImg(im2, url, f){
   destroyCrop();
   setMode(MODE, true);
   if (MODE === 0) goEl.disabled = true;   /* 预览跑通前禁止上传 */
+  goOnlyEl.disabled = goEl.disabled;
   schedulePreview(false);
 }
 function loadFile(f){
@@ -1696,6 +1809,12 @@ function applyMode(mode){
     out.id = "o-" + c.id;
     var dm = document.createElement("span");
     dm.className = "dmark off"; dm.id = "d-" + c.id; dm.textContent = "默认";
+    /* R1.3.7：点击「默认」角标恢复该项默认值（仅该项，不影响其他参数） */
+    dm.addEventListener("click", function(){
+      setCtrlVal(c, DEF[c.key]);
+      refreshDefMarks(); saveCfg(); schedulePreview(true);
+      msg("已恢复「" + lab.textContent + "」默认值", "ok");
+    });
     d.appendChild(lab); d.appendChild(in_); d.appendChild(out); d.appendChild(dm);
     box.appendChild(d);
 
@@ -1936,31 +2055,62 @@ function upload(){
   if (MODE === 0 && !img){ msg("请先选择图片", "err"); return; }
   if (MODE === 0 && !previewOK){ msg("预览生成中，请稍候再上传", "err"); return; }
   goEl.disabled = true;
+  goOnlyEl.disabled = true;
   msg("正在合成画面…", "");
   showWorkLoading("正在生成上传数据…");
-  afterLoadingPaint(buildAndUpload);
+  afterLoadingPaint(function(){ buildAndUpload(true); });
 }
-function buildAndUpload(){
+/* R1.3.1：仅上传 —— 存轮播但不刷新屏幕，缩短入库时频繁刷屏；图库仍会更新 */
+function uploadOnly(){
+  if (LOCAL_PREVIEW){
+    msg("本地预览模式：请连接 MoInk 热点后打开 http://192.168.4.1 上传", "err");
+    return;
+  }
+  if (MODE === 0 && !img){ msg("请先选择图片", "err"); return; }
+  if (MODE === 0 && !previewOK){ msg("预览生成中，请稍候再上传", "err"); return; }
+  goEl.disabled = true;
+  goOnlyEl.disabled = true;
+  msg("正在合成画面…", "");
+  showWorkLoading("正在生成上传数据…");
+  afterLoadingPaint(function(){ buildAndUpload(false); });
+}
+function buildAndUpload(show){
   var payload;
   try { payload = packFull(); }
   catch(e){
     hideWorkLoading();
     msg("合成失败：" + e.message, "err");
     goEl.disabled = false;
+    goOnlyEl.disabled = false;
     return;
   }
   var body = frameWithHeader(payload);
+  /* R1.3.3：彩色 JPEG 缩略图随帧上传。网页端从 RGB 合成图生成（画质远好于
+     2bit 缩略），body = 整帧 + 缩略头 + JPEG；tlen=JPEG 字节数。
+     生成失败则不带缩略（固件图库接口回退实时抽稀）。 */
+  var url = api(show ? "/api/frame?save=1" : "/api/frame?save=1&noshow=1");
+  try {
+    var thumb = buildThumbJpeg();
+    var nb = new Uint8Array(body.length + thumb.length);
+    nb.set(body, 0); nb.set(thumb, body.length);
+    body = nb;
+    url += "&tlen=" + (thumb.length - 16);
+  } catch(e){ /* 缩略生成失败：不带缩略上传 */ }
   msg("正在上传 " + (body.length/1024).toFixed(0) + " KB…", "");
   updateWorkLoading("正在上传… 0%");
   setBar(0);
   var xhr = new XMLHttpRequest();
-  xhr.open("POST", api("/api/frame"));
+  /* R1.3.1：上传 = 添加到轮播。show=true 用 save=1（存槽并显示），
+     show=false 用 save=1&noshow=1（仅存槽不刷屏，供「仅上传」按钮）；
+     轮播满 8 张时固件回 507 */
+  xhr.open("POST", url);
   xhr.timeout = 30000;   /* R1.0.22：软超时，弱信号下不挂死 */
   xhr.ontimeout = function(){
     hideWorkLoading();
     barEl.style.display = "none";
     msg("上传超时，请重试", "err");
     goEl.disabled = (MODE === 0) ? !img : false;
+    goOnlyEl.disabled = goEl.disabled;
   };
   xhr.upload.onprogress = function(e){
     if (e.lengthComputable){
@@ -1972,19 +2122,158 @@ function buildAndUpload(){
   xhr.onload = function(){
     hideWorkLoading();
     barEl.style.display = "none";
-    if (xhr.status === 200){ msg("已上传，屏幕刷新中…", "ok"); }
-    else { msg("上传失败：" + (xhr.responseText || ("HTTP " + xhr.status)), "err"); }
+    if (xhr.status === 200){
+      msg(show ? "已存入轮播，屏幕刷新中…" : "已存入轮播（未刷屏），图库已更新", "ok");
+      refreshGallery();
+    } else if (xhr.status === 507){
+      msg("轮播已满 8 张：请先删除或清空再上传", "err");
+      refreshGallery();
+    } else { msg("上传失败：" + (xhr.responseText || ("HTTP " + xhr.status)), "err"); }
     goEl.disabled = (MODE === 0) ? !img : false;
+    goOnlyEl.disabled = goEl.disabled;
   };
   xhr.onerror = function(){
     hideWorkLoading();
     barEl.style.display = "none";
     msg("网络错误：请确认已连接设备热点", "err");
     goEl.disabled = (MODE === 0) ? !img : false;
+    goOnlyEl.disabled = goEl.disabled;
   };
   xhr.send(body);
 }
 goEl.addEventListener("click", upload);
+goOnlyEl.addEventListener("click", uploadOnly);
+
+/* ---------- 轮播图库（R1.3.1） ---------- */
+var galGridEl = $("galGrid");
+var caroStateEl = $("caromsg");
+var PAL_RGB = [ [0,0,0], [255,255,255], [255,255,0], [255,0,0] ];   /* 0黑 1白 2黄 3红，与 quantize 色板一致 */
+
+/* 解码 2bpp 帧为 ImageData：与固件/合成管线的 packIdx 契约一致
+   （行自下而上、列右到左、字节内 MSB 优先），画布顶行 = 设备底行。 */
+function decodeFrame(payload, w, h){
+  var RB = w >> 2, img = new ImageData(w, h), d = img.data;
+  for (var r = 0; r < h; r++){
+    var bo = r * RB;
+    for (var xb = 0; xb < RB; xb++){
+      var v = payload[bo + xb];
+      var xa = w - 4 - (xb << 2);
+      for (var k = 0; k < 4; k++){
+        var c = (v >> (k * 2)) & 3;
+        var px = xa + k, cy = h - 1 - r;
+        var o = (cy * w + px) * 4;
+        d[o] = PAL_RGB[c][0]; d[o+1] = PAL_RGB[c][1]; d[o+2] = PAL_RGB[c][2]; d[o+3] = 255;
+      }
+    }
+  }
+  return img;
+}
+/* 渲染到画布：rot=true 时旋转 90° 竖向显示（与编辑界面方向一致——
+   上传时前端把竖向合成图顺时针转 90° 打包成设备横向帧，因此设备帧回到
+   竖向须逆时针转 90°。缩略图/大图预览均用）。 */
+function renderFrameToCanvas(canvas, payload, w, h, rot){
+  var tmp = document.createElement("canvas");
+  tmp.width = w; tmp.height = h;
+  tmp.getContext("2d").putImageData(decodeFrame(payload, w, h), 0, 0);
+  canvas.width = rot ? h : w;
+  canvas.height = rot ? w : h;
+  var ctx = canvas.getContext("2d");
+  if (rot){
+    ctx.translate(0, canvas.height);
+    ctx.rotate(-Math.PI / 2);
+  }
+  ctx.drawImage(tmp, 0, 0, w, h);
+}
+function b64ToBytes(b64){
+  var bin = atob(b64), out = new Uint8Array(bin.length);
+  for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+function refreshGallery(){
+  if (LOCAL_PREVIEW){ galGridEl.innerHTML = ""; caroStateEl.textContent = ""; return; }
+  fetch(api("/api/carousel/list")).then(function(r){ return r.json(); }).then(function(j){
+    caroStateEl.textContent = (j.count || 0) + " / " + (j.slots || 0) + " 张";
+    var html = [], items = j.items || [];
+    for (var i = 0; i < (j.slots || 8); i++){
+      var it = null;
+      for (var k = 0; k < items.length; k++) if (items[k].slot === i) { it = items[k]; break; }
+      if (it && it.len > 0){
+        /* fmt=2 彩色 JPEG 缩略 → <img> 直接显示；fmt=1 2bit → canvas 旋转渲染 */
+        var isJpg = (it.fmt === 2);
+        html.push('<div class="galCell' + (i === j.cur ? ' cur' : '') + '" data-slot="' + i + '">'
+                + (isJpg ? '<img data-slot="' + i + '" alt="">' : '<canvas data-slot="' + i + '"></canvas>')
+                + '<button class="galDel" data-slot="' + i + '">×</button></div>');
+      } else {
+        html.push('<div class="galEmpty">空</div>');
+      }
+    }
+    galGridEl.innerHTML = html.join("");
+    var thumbs = galGridEl.querySelectorAll(".galCell canvas, .galCell img");
+    for (var m = 0; m < thumbs.length; m++){
+      var s = parseInt(thumbs[m].getAttribute("data-slot"), 10);
+      for (var k2 = 0; k2 < items.length; k2++){
+        if (items[k2].slot === s){
+          try {
+            if (items[k2].fmt === 2)
+              thumbs[m].src = "data:image/jpeg;base64," + items[k2].data;
+            else
+              renderFrameToCanvas(thumbs[m], b64ToBytes(items[k2].data), items[k2].w, items[k2].h, true);
+          } catch(e){ /* 缩略图渲染失败留空 */ }
+          break;
+        }
+      }
+    }
+  }).catch(function(){ caroStateEl.textContent = "未连接"; });
+}
+
+function deleteSlot(slot){
+  if (!confirm("删除这张轮播图？")) return;
+  fetch(api("/api/carousel/delete?slot=" + slot), { method: "POST" }).then(function(r){
+    if (r.status === 200){ saveState("caromsg", "ok", "已删除"); refreshGallery(); }
+    else { saveState("caromsg", "err", "删除失败：HTTP " + r.status); }
+  }).catch(function(){ saveState("caromsg", "err", "网络错误"); });
+}
+
+function showPreview(slot){
+  if (LOCAL_PREVIEW) return;
+  /* R1.3.4：读取大图期间弹上传同款遮罩——锁定操作 + 进度反馈 */
+  showWorkLoading("正在读取…");
+  fetch(api("/api/carousel/full?slot=" + slot)).then(function(r){
+    if (r.status !== 200) throw new Error("HTTP " + r.status);
+    return r.arrayBuffer();
+  }).then(function(ab){
+    var u8 = new Uint8Array(ab);
+    var w = (u8[4] << 8) | u8[5], h = (u8[6] << 8) | u8[7];
+    renderFrameToCanvas($("prevCanvas"), u8.subarray(16), w, h, true);
+    hideWorkLoading();
+    $("prevOverlay").style.display = "flex";
+  }).catch(function(e){ hideWorkLoading(); saveState("caromsg", "err", "预览失败：" + e.message); });
+}
+
+function clearCarousel(){
+  if (!confirm("清空全部轮播图片？")) return;
+  fetch(api("/api/carousel/clear"), { method: "POST" }).then(function(r){
+    if (r.status === 200){ saveState("caromsg", "ok", "已清空轮播"); refreshGallery(); }
+    else { saveState("caromsg", "err", "清空失败：HTTP " + r.status); }
+  }).catch(function(){ saveState("caromsg", "err", "网络错误"); });
+}
+
+galGridEl.addEventListener("click", function(ev){
+  var t = ev.target;
+  if (t.classList && t.classList.contains("galDel")){
+    deleteSlot(parseInt(t.getAttribute("data-slot"), 10));
+    return;
+  }
+  var cell = t.closest ? t.closest(".galCell") : null;
+  if (cell) showPreview(parseInt(cell.getAttribute("data-slot"), 10));
+});
+$("carouselClear").addEventListener("click", clearCarousel);
+$("prevClose").addEventListener("click", function(){ $("prevOverlay").style.display = "none"; });
+$("prevOverlay").addEventListener("click", function(ev){
+  if (ev.target && ev.target.id === "prevOverlay") this.style.display = "none";
+});
+refreshGallery();
 
 /* ---------- 设备信息 / 设置 ---------- */
 function setTab(t){

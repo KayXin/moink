@@ -41,7 +41,15 @@ int frame_display_now(void);
 /* R1.0.8：残影清理（持帧锁，与传图/显示互斥）。成功返回 0。 */
 int frame_clear_cycles(int cycles);
 
-/* POST /api/frame 处理器：收头 -> 校验 -> 流式收载荷并算 CRC -> 触发显示。 */
+/* POST /api/frame 处理器：收头 -> 校验 -> 流式收载荷并算 CRC -> 触发显示。
+   R1.3.0 轮播 query：
+     save=1            存槽并显示
+     save=1&noshow=1  只存不显示（批量上传前几张，避免逐张刷屏）
+     无 save           只显示不存（原行为） */
 esp_err_t frame_upload_handler(httpd_req_t *req);
+
+/* R1.3.0 轮播：读 store 槽 slot（头+载荷）-> 校验几何 -> 整屏显示。
+   与传图/残影清理共用帧缓冲锁。成功返回 0，空/坏槽或几何不符返回非 0。 */
+int frame_display_slot(int slot);
 
 #endif /* MOINK_FRAME_H */

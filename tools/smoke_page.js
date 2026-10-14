@@ -2,7 +2,8 @@
 // 抽取 page/index.html 主脚本的纯函数段（算法 + 打包 + 帧头），在最小 sandbox 里跑断言。
 // 覆盖：CRC16 金标准、帧头 16 字节字段、packIdx 纯色打包、
 //       R1.0.12 结构（Cropper 内嵌 / 文字对象 / 留白 / 双 script 闭合符）、
-//       R1.2.0 统一升级入口（/api/upload）+ 单一版本号显示。
+//       R1.2.0 统一升级入口（/api/upload）+ 单一版本号显示、
+//       R1.3.0 轮播图库（4 条 /api/carousel/* 路由 + save/noshow/tlen + 页面图库 UI）。
 //
 // 用法：node tools/smoke_page.js   （tools/ 下已有 package.json 声明 commonjs）
 "use strict";
@@ -245,7 +246,7 @@ ok("R1.2.0 热点密码单字段语义（留空=保持 / 勾选清除=开放，F
 ok("R1.2.0 热点保存按需携带 pass（缺省不发送 = 固件保持）",
    js.indexOf('if ($("apClearPw").checked) fields.pass = "";') >= 0
    && js.indexOf('else if ($("apPass").value) fields.pass = $("apPass").value;') >= 0);
-ok("R1.2.2 版本 meta", page.indexOf('content="R1.2.2"') >= 0);
+ok("R1.3.0 版本 meta", page.indexOf('content="R1.3.0"') >= 0);
 ok("R1.2.1 正式配置页不含 iOS captive 专用渲染逻辑",
    js.indexOf("captiveLitePreview") < 0 && js.indexOf("iosDevice") < 0
    && page.indexOf("iosCaptiveNotice") < 0
@@ -254,7 +255,7 @@ ok("R1.2.1 上传前显示 loading",
    page.indexOf('id="workLoading"') >= 0 && page.indexOf('id="workLoadingText"') >= 0
    && js.indexOf("function afterLoadingPaint(fn)") >= 0
    && js.indexOf('showWorkLoading("正在生成上传数据…")') >= 0
-   && js.indexOf("afterLoadingPaint(buildAndUpload)") >= 0);
+   && js.indexOf("afterLoadingPaint(function(){ buildAndUpload(true); })") >= 0);
 ok("R1.2.1 裁剪手势松手后才生成目标预览",
    js.indexOf("crop: function(){ schedulePreview(true); }") < 0
    && js.indexOf("cropend: function(){ cropInvalid(); schedulePreview(false); }") >= 0);
@@ -310,6 +311,66 @@ ok("页脚存在 (footer#appFoot)",
 ok("页脚含 GitHub 地址", page.indexOf('href="https://github.com/atunverse/moink"') >= 0);
 ok("页脚版本号运行时填充 (footVer + meta)",
    page.indexOf('id="footVer"') >= 0 && page.indexOf('meta[name="moink-page-version"]') >= 0);
+
+// =====================================================================
+// R1.3.0：多图轮播图库（FB-017 第二部分）—— 固件 / 页面 / 契约三方交叉校验
+// =====================================================================
+const frameC = fs.readFileSync(path.join(__dirname, "..", "src", "frame.c"), "utf8");
+const storeC = fs.readFileSync(path.join(__dirname, "..", "src", "store.c"), "utf8");
+const storeH = fs.readFileSync(path.join(__dirname, "..", "src", "store.h"), "utf8");
+const contract = fs.readFileSync(path.join(__dirname, "..", "docs", "CONTRACT.md"), "utf8");
+
+ok("R1.3.0 固件侧：4 条轮播路由注册",
+   mainC.indexOf('"/api/carousel/list"') >= 0 && mainC.indexOf('"/api/carousel/full"') >= 0
+   && mainC.indexOf('"/api/carousel/delete"') >= 0 && mainC.indexOf('"/api/carousel/clear"') >= 0);
+ok("R1.3.0 固件侧：max_uri_handlers=32（修 HANDLERS_FULL abort 循环）",
+   mainC.indexOf("#define HTTPD_MAX_URI   32") >= 0
+   && mainC.indexOf("cfg.max_uri_handlers = HTTPD_MAX_URI") >= 0);
+ok("R1.3.0 固件侧：httpd 任务栈 8192",
+   mainC.indexOf("#define HTTPD_STACK     8192") >= 0);
+ok("R1.3.0 固件侧：/api/frame query save / noshow / tlen",
+   frameC.indexOf('"save"') >= 0 && frameC.indexOf('"noshow"') >= 0
+   && frameC.indexOf('"tlen"') >= 0
+   && frameC.indexOf("bool want_save = false, want_show = true;") >= 0);
+ok("R1.3.0 固件侧：轮播满 8 返回 HTTP 507",
+   frameC.indexOf("STORE_ERR_FULL") >= 0 && frameC.indexOf("507") >= 0);
+ok("R1.3.0 固件侧：store 保存/读取/删除/清空 四件套",
+   storeC.indexOf("int store_save_frame(") >= 0 && storeC.indexOf("int store_load_slot(") >= 0
+   && storeC.indexOf("int store_delete_slot(") >= 0 && storeC.indexOf("void store_clear(") >= 0);
+ok("R1.3.0 固件侧：缩略上限统一 STORE_THUMB_JPEG_MAX",
+   storeH.indexOf("#define STORE_THUMB_JPEG_MAX 20000u") >= 0
+   && frameC.indexOf("STORE_THUMB_JPEG_MAX") >= 0 && storeC.indexOf("STORE_THUMB_JPEG_MAX") >= 0);
+ok("R1.3.0 固件侧：按键短按切图 + 唤醒即切图",
+   mainC.indexOf("static void carousel_next(void)") >= 0
+   && mainC.indexOf("s_woken_by_btn") >= 0 && mainC.indexOf("frame_display_slot") >= 0);
+ok("R1.3.0 页面：图库卡片 + 大图预览层元素",
+   page.indexOf('id="galGrid"') >= 0 && page.indexOf('id="carouselClear"') >= 0
+   && page.indexOf('id="prevOverlay"') >= 0 && page.indexOf('id="prevCanvas"') >= 0
+   && page.indexOf('id="prevClose"') >= 0 && page.indexOf('id="caromsg"') >= 0);
+ok("R1.3.0 页面：「仅上传」按钮 + 双语义上传（save=1 / noshow=1）",
+   page.indexOf('id="goOnly"') >= 0 && js.indexOf("function uploadOnly()") >= 0
+   && js.indexOf("function buildAndUpload(show)") >= 0
+   && js.indexOf('"/api/frame?save=1"') >= 0
+   && js.indexOf('"/api/frame?save=1&noshow=1"') >= 0);
+ok("R1.3.0 页面：轮播满 8 的 507 提示",
+   js.indexOf("xhr.status === 507") >= 0 && js.indexOf("轮播已满 8 张") >= 0);
+ok("R1.3.0 页面：缩略随帧上传（buildThumbJpeg + &tlen= + 缩略头 fmt=2）",
+   js.indexOf("function buildThumbJpeg()") >= 0 && js.indexOf("&tlen=") >= 0
+   && js.indexOf("hdr[2] = 2;") >= 0);
+ok("R1.3.0 页面：图库四接口 + 整帧解码/旋转渲染",
+   js.indexOf('api("/api/carousel/list")') >= 0
+   && js.indexOf('api("/api/carousel/full?slot=" + slot)') >= 0
+   && js.indexOf('api("/api/carousel/delete?slot=" + slot)') >= 0
+   && js.indexOf('api("/api/carousel/clear")') >= 0
+   && js.indexOf("function decodeFrame(payload, w, h)") >= 0
+   && js.indexOf("function renderFrameToCanvas(canvas, payload, w, h, rot)") >= 0);
+ok("主帧头仍固定 hdr[2]=1（fmt=2 只用于缩略头）",
+   js.indexOf("hdr[2] = 1;") >= 0);
+ok("R1.3.0 CONTRACT 已同步轮播契约",
+   contract.indexOf("### 1.1 随帧携带的缩略载荷") >= 0
+   && contract.indexOf("/api/carousel/list") >= 0
+   && contract.indexOf("store_count") >= 0
+   && contract.indexOf("version = R1.3.0") >= 0);
 
 console.log(failed === 0 ? "SMOKE: ALL PASS" : ("SMOKE: " + failed + " FAILED"));
 process.exit(failed === 0 ? 0 : 1);

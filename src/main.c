@@ -28,6 +28,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <inttypes.h>
+#include <stdbool.h>
 
 #include "driver/gpio.h"
 #include "esp_log.h"
@@ -55,8 +56,13 @@
 static const char *TAG = "main";
 
 #define HOLD_RESET_S    5          /* 长按恢复出厂 */
-#define HTTPD_STACK     4096
-#define HTTPD_MAX_URI   16
+#define HTTPD_STACK     8192       /* R1.3.1：轮播 list 组装 base64 需要更大栈 */
+#define HTTPD_MAX_URI   32         /* R1.3.1：16 条业务路由 + OTA + captive 兜底约 19 个，
+                                       默认 8 会满（ESP_ERR_HTTPD_HANDLERS_FULL → abort 循环） */
+
+/* R1.3.0：GPIO 唤醒 = 用户按过键。唤醒的这次按下也算一次短按（切图），
+   由 button_task 消费（见其注释）。 */
+static bool s_woken_by_btn = false;
 
 /* ---------------- 请求小工具 ---------------- */
 
@@ -151,18 +157,23 @@ static esp_err_t info_handler(httpd_req_t *req)
     /* ver = 统一版本号 = 当前生效页面版本（热更页优先，否则等于固件编译号）。
        fw  = 固件编译进去的号：仅供排障，以及判断「热更控制页是否落后于固件」
              （ver < fw 时页面给黄色警示），界面只显示 ver。
-       api 仍是帧格式契约号，与发布版本号解耦，页面状态栏另起一行显示。 */
+       api 仍是帧格式契约号，与发布版本号解耦，页面状态栏另起一行显示。
+       store_slots / store_count / store_cur：轮播容量与当前状态（R1.3.0）。 */
+    int caro_count = 0, caro_cur = 0;
+    store_meta_get(&caro_count, &caro_cur);
     int n = snprintf(buf, sizeof(buf),
         "{\"ver\":\"%s\",\"fw\":\"%s\",\"api\":%d,"
         "\"panel\":\"%s\",\"gpio_preset\":%u,\"heap\":%lu,\"bat_mv\":%d,"
         "\"sleep_s\":%lu,\"wake_s\":%lu,\"clients\":%d,"
-        "\"ssid\":\"%s\",\"uptime\":%lld,\"store_slots\":%d}",
+        "\"ssid\":\"%s\",\"uptime\":%lld,\"store_slots\":%d,"
+        "\"store_count\":%d,\"store_cur\":%d}",
         ota_web_page_version(), MOINK_VERSION, MOINK_API_VERSION,
         epd_panel_name((epd_panel_t)s->panel), (unsigned)s->gpio_preset,
         (unsigned long)esp_get_free_heap_size(), power_battery_mv(),
         (unsigned long)s->sleep_s, (unsigned long)s->wake_s,
         netif_ap_client_count(), netif_ap_ssid(),
-        (long long)(esp_timer_get_time() / 1000000), store_slots());
+        (long long)(esp_timer_get_time() / 1000000), store_slots(),
+        caro_count, caro_cur);
     if (n < 0 || n >= (int)sizeof(buf)) buf[sizeof(buf) - 1] = '\0';
 
     httpd_resp_set_type(req, "application/json");
@@ -322,6 +333,218 @@ static esp_err_t factory_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* R1.3.0：清空轮播（只清元数据，不擦 flash，槽位留待下次写入覆盖）。 */
+static esp_err_t clear_carousel_handler(httpd_req_t *req)
+{
+    power_activity();
+    store_clear();
+    httpd_resp_set_type(req, "text/plain");
+    return httpd_resp_sendstr(req, "OK");
+}
+
+/* ---------------- R1.3.1 轮播管理：list / delete / full ---------------- */
+
+/* base64 分块编码并逐块发送：源数据按 3 字节/块编码为 4 字符，
+   缓冲固定 ~5.5KB，避免为整图开 40KB 堆缓冲（C3 堆余量 8~26KB）。 */
+static void b64_send_chunked(httpd_req_t *req, const uint8_t *in, size_t n)
+{
+    static const char T[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    char buf[4096 * 4 / 3 + 8];
+    size_t off = 0;
+    while (off < n) {
+        size_t cnt = n - off;
+        if (cnt > 4095) cnt = 4095;    /* 3 的倍数，避免跨块截断三元组 */
+        size_t i = 0, o = 0;
+        while (i + 3 <= cnt) {
+            uint32_t v = ((uint32_t)in[off+i] << 16) | ((uint32_t)in[off+i+1] << 8) |
+                         in[off+i+2];
+            buf[o++] = T[(v >> 18) & 63]; buf[o++] = T[(v >> 12) & 63];
+            buf[o++] = T[(v >> 6) & 63];  buf[o++] = T[v & 63];
+            i += 3;
+        }
+        if (i + 1 == cnt) {
+            uint32_t v = (uint32_t)in[off+i] << 16;
+            buf[o++] = T[(v >> 18) & 63]; buf[o++] = T[(v >> 12) & 63];
+            buf[o++] = '='; buf[o++] = '=';
+        } else if (i + 2 == cnt) {
+            uint32_t v = ((uint32_t)in[off+i] << 16) | ((uint32_t)in[off+i+1] << 8);
+            buf[o++] = T[(v >> 18) & 63]; buf[o++] = T[(v >> 12) & 63];
+            buf[o++] = T[(v >> 6) & 63];  buf[o++] = '=';
+        }
+        httpd_resp_send_chunk(req, buf, o);
+        off += cnt;
+    }
+}
+
+static esp_err_t carousel_list_handler(httpd_req_t *req)
+{
+    power_activity();
+    int count = 0, cur = 0;
+    store_meta_get(&count, &cur);
+
+    char head[96];
+    snprintf(head, sizeof(head), "{\"slots\":%d,\"count\":%d,\"cur\":%d,\"items\":[",
+             store_slots(), count, cur);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send_chunk(req, head, strlen(head));
+
+    char item[160];
+    for (int i = 0; i < count; i++) {
+        int fmt = 1, tw = 0, th = 0;
+        uint32_t tlen = 0;
+        const uint8_t *payload = NULL;
+        uint8_t *dyn = NULL;
+
+        /* 路径 A：预存缩略（R1.3.2/3）。直接读缩略头拿 fmt/tlen，
+           按实际大小 malloc，避免按 20KB 上限一次性分配 */
+        const esp_partition_t *sp = store_part();
+        uint32_t off = (uint32_t)i * STORE_SLOT_SZ;
+        uint8_t fhdr[16], thdr[16];
+        int has_pre = 0;
+        uint32_t flen = 0;
+        if (sp &&
+            esp_partition_read(sp, off, fhdr, sizeof(fhdr)) == ESP_OK &&
+            fhdr[0] == STORE_MAGIC0 && fhdr[1] == STORE_MAGIC1) {
+            flen = ((uint32_t)fhdr[8] << 24) | ((uint32_t)fhdr[9] << 16) |
+                   ((uint32_t)fhdr[10] << 8) | fhdr[11];
+            if (flen && flen <= STORE_FRAME_MAX &&
+                esp_partition_read(sp, off + 16 + flen, thdr,
+                                   sizeof(thdr)) == ESP_OK &&
+                thdr[0] == STORE_MAGIC0 && thdr[1] == STORE_MAGIC1) {
+                uint32_t tl = ((uint32_t)thdr[8] << 24) | ((uint32_t)thdr[9] << 16) |
+                              ((uint32_t)thdr[10] << 8) | thdr[11];
+                uint32_t lim = (thdr[2] == 2) ? STORE_THUMB_JPEG_MAX
+                                               : STORE_THUMB_LEN;
+                if (tl && tl <= lim) {
+                    fmt = (thdr[2] == 2) ? 2 : 1;
+                    tw = (int)((thdr[4] << 8) | thdr[5]);
+                    th = (int)((thdr[6] << 8) | thdr[7]);
+                    tlen = tl;
+                    has_pre = 1;
+                }
+            }
+        }
+        if (!has_pre) {
+            /* 路径 B：回退固件现算 2bit 缩略 */
+            dyn = malloc(STORE_THUMB_ENTRY);
+            if (!dyn) { fmt = 1; tw = 0; th = 0; tlen = 0; }
+            else {
+                int n = store_thumb_frame(i, dyn, STORE_THUMB_ENTRY);
+                if (n <= 16) {
+                    free(dyn); dyn = NULL;
+                    fmt = 1; tw = 0; th = 0; tlen = 0;
+                } else {
+                    fmt = 1;
+                    tw = (int)((dyn[4] << 8) | dyn[5]);
+                    th = (int)((dyn[6] << 8) | dyn[7]);
+                    tlen = (uint32_t)(n - 16);
+                    payload = dyn + 16;
+                }
+            }
+        } else {
+            /* 路径 A：按实际 tlen 分配并读载荷 */
+            dyn = malloc(tlen);
+            if (!dyn || esp_partition_read(sp, off + 16 + flen + 16,
+                                           dyn, tlen) != ESP_OK) {
+                free(dyn); dyn = NULL;
+                tw = 0; th = 0; tlen = 0;
+            } else {
+                payload = dyn;
+            }
+        }
+
+        if (!tlen) {
+            snprintf(item, sizeof(item), "%s{\"slot\":%d,\"fmt\":1,\"w\":0,\"h\":0,\"len\":0,\"data\":\"\"}",
+                     i ? "," : "", i);
+            httpd_resp_send_chunk(req, item, strlen(item));
+        } else {
+            snprintf(item, sizeof(item), "%s{\"slot\":%d,\"fmt\":%d,\"w\":%d,\"h\":%d,\"len\":%lu,\"data\":\"",
+                     i ? "," : "", i, fmt, tw, th, (unsigned long)tlen);
+            httpd_resp_send_chunk(req, item, strlen(item));
+            b64_send_chunked(req, payload, tlen);
+            httpd_resp_send_chunk(req, "\"}", 2);
+        }
+        free(dyn);
+    }
+    httpd_resp_send_chunk(req, "]}", 2);
+    httpd_resp_send_chunk(req, NULL, 0);
+    return ESP_OK;
+}
+
+/* POST /api/carousel/delete?slot=N：删除并紧凑前移。 */
+static esp_err_t carousel_delete_handler(httpd_req_t *req)
+{
+    power_activity();
+    char qbuf[40], vs[8];
+    if (httpd_req_get_url_query_len(req) <= 0 ||
+        httpd_req_get_url_query_len(req) >= (int)sizeof(qbuf) ||
+        httpd_req_get_url_query_str(req, qbuf, sizeof(qbuf)) != ESP_OK ||
+        !kv_get(qbuf, "slot", vs, sizeof(vs)))
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad query");
+    int slot = atoi(vs);
+    if (store_delete_slot(slot) != 0)
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad slot");
+    httpd_resp_set_type(req, "text/plain");
+    return httpd_resp_sendstr(req, "OK");
+}
+
+/* GET /api/carousel/full?slot=N：返回整帧二进制（16B 头 + 2bpp 载荷），
+   供网页「点击缩略图 → 大图预览」。流式读 flash 分块发送：
+   不整帧 malloc（120KB 在堆紧张时失败导致 500），只开 4KB 小块缓冲。 */
+static esp_err_t carousel_full_handler(httpd_req_t *req)
+{
+    power_activity();
+    char qbuf[40], vs[8];
+    if (httpd_req_get_url_query_len(req) <= 0 ||
+        httpd_req_get_url_query_len(req) >= (int)sizeof(qbuf) ||
+        httpd_req_get_url_query_str(req, qbuf, sizeof(qbuf)) != ESP_OK ||
+        !kv_get(qbuf, "slot", vs, sizeof(vs)))
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad query");
+    int slot = atoi(vs);
+    if (slot < 0 || slot >= STORE_SLOT_MAX)
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad slot");
+
+    const esp_partition_t *sp = store_part();
+    if (!sp)
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "store off");
+    uint32_t off = (uint32_t)slot * STORE_SLOT_SZ;
+
+    uint8_t hdr[16];
+    if (esp_partition_read(sp, off, hdr, sizeof(hdr)) != ESP_OK ||
+        hdr[0] != STORE_MAGIC0 || hdr[1] != STORE_MAGIC1)
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad slot");
+    uint32_t len = ((uint32_t)hdr[8] << 24) | ((uint32_t)hdr[9] << 16) |
+                   ((uint32_t)hdr[10] << 8) | hdr[11];
+    if (len == 0 || len > STORE_FRAME_MAX)
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad slot");
+
+    httpd_resp_set_type(req, "application/octet-stream");
+    if (httpd_resp_send_chunk(req, (const char *)hdr, sizeof(hdr)) != ESP_OK)
+        return ESP_FAIL;
+
+    uint8_t *chunk = malloc(4096);
+    if (!chunk)
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+    uint32_t sent = 0;
+    while (sent < len) {
+        uint32_t k = (len - sent > 4096) ? 4096 : len - sent;
+        if (esp_partition_read(sp, off + 16 + sent, chunk, k) != ESP_OK) {
+            free(chunk);
+            return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                       "read fail");
+        }
+        if (httpd_resp_send_chunk(req, (const char *)chunk, k) != ESP_OK) {
+            free(chunk);
+            return ESP_FAIL;
+        }
+        sent += k;
+    }
+    httpd_resp_send_chunk(req, NULL, 0);
+    free(chunk);
+    return ESP_OK;
+}
+
 /* R1.2.2：改 GPIO 后由页面调用 —— SPI 总线与 ADC 通道只能在启动时按引脚
    初始化，因此引脚生效的唯一途径是重启。先应答再重启，避免页面收不到 200。 */
 static esp_err_t reboot_handler(httpd_req_t *req)
@@ -375,6 +598,10 @@ static httpd_handle_t start_server(void)
         { .uri = "/api/settings",   .method = HTTP_GET,    .handler = settings_get_handler, .user_ctx = NULL },
         { .uri = "/api/settings",   .method = HTTP_POST,   .handler = settings_post_handler,.user_ctx = NULL },
         { .uri = "/api/frame",      .method = HTTP_POST,   .handler = frame_upload_handler, .user_ctx = NULL },
+        { .uri = "/api/carousel/clear", .method = HTTP_POST, .handler = clear_carousel_handler, .user_ctx = NULL },
+        { .uri = "/api/carousel/list",  .method = HTTP_GET,  .handler = carousel_list_handler,  .user_ctx = NULL },
+        { .uri = "/api/carousel/delete",.method = HTTP_POST, .handler = carousel_delete_handler,.user_ctx = NULL },
+        { .uri = "/api/carousel/full",  .method = HTTP_GET,  .handler = carousel_full_handler,  .user_ctx = NULL },
         { .uri = "/api/clear",      .method = HTTP_POST,   .handler = clear_handler,        .user_ctx = NULL },
         { .uri = "/api/reboot",     .method = HTTP_POST,   .handler = reboot_handler,       .user_ctx = NULL },
         { .uri = "/api/factory",    .method = HTTP_POST,   .handler = factory_handler,      .user_ctx = NULL },
@@ -423,11 +650,32 @@ static void idle_monitor_task(void *arg)
     }
 }
 
+/* R1.3.0 轮播：切到下一张（读 store 槽并整屏显示）。count<=1 时无动作。
+   切图后刷新活动计时，避免刚切完就被空闲深睡。 */
+static void carousel_next(void)
+{
+    int count = 0, cur = 0;
+    store_meta_get(&count, &cur);
+    if (count <= 0) return;
+    cur = (cur + 1) % count;
+    store_meta_set(count, cur);
+    ESP_LOGI(TAG, "carousel: next -> slot %d (count %d)", cur, count);
+    if (frame_display_slot(cur) == 0) {
+        power_activity();
+    }
+}
+
 static void button_task(void *arg)
 {
     (void)arg;
     const gpio_num_t btn = (gpio_num_t)settings_pins()->v[PIN_IDX_WAKE];
     int held = 0;
+
+    /* 唤醒语义（R1.3.0）：GPIO 唤醒 = 用户按过键。若此刻键仍按住，等它松开，
+       那次松开算一次短按；若已松开（启动慢于松手），补一次切图。 */
+    bool pending = s_woken_by_btn;
+    bool waiting = pending && (gpio_get_level(btn) == 0);
+
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(50));
         bool down = (gpio_get_level(btn) == 0);
@@ -443,7 +691,18 @@ static void button_task(void *arg)
                 esp_restart();
             }
         } else {
-            held = 0;
+            if (held > 0) {
+                /* 刚松开：<5s 视为短按（含唤醒那次），切下一张 */
+                if (held < HOLD_RESET_S * 20) {
+                    if (waiting) waiting = false;
+                    carousel_next();
+                }
+                held = 0;
+            } else if (pending && !waiting) {
+                /* 唤醒瞬间键已松开：补一次切图 */
+                pending = false;
+                carousel_next();
+            }
         }
     }
 }
@@ -482,6 +741,7 @@ void app_main(void)
     power_set_auto_wake(auto_wake);
     if (wake & (1u << ESP_SLEEP_WAKEUP_GPIO)) {
         ESP_LOGI(TAG, "woken by GPIO%u button", settings_pins()->v[PIN_IDX_WAKE]);
+        s_woken_by_btn = true;   /* R1.3.0：唤醒的这次按下也算一次短按（切图） */
     } else if (auto_wake) {
         ESP_LOGI(TAG, "woken by RTC timer (auto wake)");
     } else if (wake) {
