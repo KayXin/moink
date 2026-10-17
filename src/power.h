@@ -33,7 +33,7 @@ bool power_should_sleep(void);
 /* 设唤醒源并进入深睡（不返回）。 */
 void power_enter_deep_sleep(void);
 
-/* 电池电压 mV 粗测（分压 100k:100k；满量程需按板实测标定）。 */
+/* 电池电压 mV 粗测（分压 1M:1M，×2.0；满量程需按板实测标定）。 */
 int power_battery_mv(void);
 
 #endif /* MOINK_POWER_H */

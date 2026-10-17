@@ -14,8 +14,10 @@ static const char *TAG = "power";
 
 #define AUTO_WAKE_WINDOW_S 180   /* 定时唤醒后等人的窗口（秒） */
 
-/* 电池分压 100k:100k => Vbat = Vpin * (100k+100k)/100k = Vpin * 2.0。
-   ⚠️ 分压比是板级硬件事实：换板 / 改电阻必须同步改这里，否则电量整体偏移。 */
+/* 电池分压 1M:1M => Vbat = Vpin * (1M+1M)/1M = Vpin * 2.0（比值与 100k:100k 相同）。
+   ⚠️ 分压比是板级硬件事实：换板 / 改电阻必须同步改这里，否则电量整体偏移。
+   ⚠️ 1M 高阻源（≈500k 输出阻抗）会让 ADC 读数偏低：ADC 端建议并联 100nF 到地，
+      并在换板后按实测复核 BAT_FULLSCALE_MV。 */
 #define BAT_DIV_NUM        200
 #define BAT_DIV_DEN        100
 #define BAT_ADC_MAX        4095

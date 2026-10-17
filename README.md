@@ -40,7 +40,7 @@
 | 主控 | ESP32-C3 SUPERMINI（RISC-V 单核，无 PSRAM） |
 | 屏幕 | 华为拆机 768×552 四色电子墨水屏（黑/白/黄/红，2bpp） |
 | 唤醒按键 | GPIO5 → GND（低电平，长按 5s 恢复出厂） |
-| 电池检测 | GPIO0（ADC1_CH0，100k:100k 分压） |
+| 电池检测 | GPIO0（ADC1_CH0，1M:1M 分压） |
 | 屏幕接线 | SCK=4 / MOSI=6 / CS=7 / DC=1 / RST=3 / BUSY=10 |
 
 ## 🚀 快速开始

@@ -18,6 +18,9 @@ const netifAp = fs.readFileSync(path.join(__dirname, "..", "src", "netif_ap.c"),
 const settingsH = fs.readFileSync(path.join(__dirname, "..", "src", "settings.h"), "utf8");
 const epdDrvC = fs.readFileSync(path.join(__dirname, "..", "src", "epd_drv.c"), "utf8");
 const mainC = fs.readFileSync(path.join(__dirname, "..", "src", "main.c"), "utf8");
+// 版本号动态取自 version.h，避免每次升版都要改断言
+const versionH = fs.readFileSync(path.join(__dirname, "..", "src", "version.h"), "utf8");
+const VER = (/#define\s+MOINK_VERSION\s+"([^"]+)"/.exec(versionH) || [])[1] || "";
 const settingsC = fs.readFileSync(path.join(__dirname, "..", "src", "settings.c"), "utf8");
 // R1.0.12 起页面有两个 <script> 块（第 1 块 = 内嵌 Cropper.js，第 2 块 = 主脚本）。
 // \r?\n：兼容 core.autocrlf 检出为 CRLF 的工作区（2026-09-22 修正）。
@@ -246,7 +249,7 @@ ok("R1.2.0 热点密码单字段语义（留空=保持 / 勾选清除=开放，F
 ok("R1.2.0 热点保存按需携带 pass（缺省不发送 = 固件保持）",
    js.indexOf('if ($("apClearPw").checked) fields.pass = "";') >= 0
    && js.indexOf('else if ($("apPass").value) fields.pass = $("apPass").value;') >= 0);
-ok("R1.3.0 版本 meta", page.indexOf('content="R1.3.0"') >= 0);
+ok(VER + " 版本 meta", !!VER && page.indexOf('content="' + VER + '"') >= 0);
 ok("R1.2.1 正式配置页不含 iOS captive 专用渲染逻辑",
    js.indexOf("captiveLitePreview") < 0 && js.indexOf("iosDevice") < 0
    && page.indexOf("iosCaptiveNotice") < 0
@@ -370,7 +373,7 @@ ok("R1.3.0 CONTRACT 已同步轮播契约",
    contract.indexOf("### 1.1 随帧携带的缩略载荷") >= 0
    && contract.indexOf("/api/carousel/list") >= 0
    && contract.indexOf("store_count") >= 0
-   && contract.indexOf("version = R1.3.0") >= 0);
+   && contract.indexOf("version = " + VER) >= 0);
 
 console.log(failed === 0 ? "SMOKE: ALL PASS" : ("SMOKE: " + failed + " FAILED"));
 process.exit(failed === 0 ? 0 : 1);

@@ -16,8 +16,8 @@ static const char *TAG = "settings";
 const pin_cfg_t PIN_PRESETS[GPIO_PRESET_NPRESET] = {
     /* [0] 默认：SCK=4 MOSI=6 CS=7 DC=1 RST=3 BUSY=10，唤醒=5，ADC=0 */
     [GPIO_PRESET_DEFAULT] = { { 0, 5, 4, 6, 7, 1, 3, 10 } },
-    /* [1] 排线：SCK=7 MOSI=10 CS=6 DC=4 RST=3 BUSY=1，唤醒=5，ADC=0 */
-    [GPIO_PRESET_LINE]    = { { 0, 5, 7, 10, 6, 4, 3, 1 } },
+    /* [1] 排线（R1.3.1 改版）：ADC=0 唤醒=1 BUSY=3 RST=4 DC=5 CS=6 SCK=7 DIN=10，自锁固定 2 */
+    [GPIO_PRESET_LINE]    = { { 0, 1, 7, 10, 6, 5, 4, 3 } },
     /* [2] 整合板：SCK=4 MOSI=3 CS=5 DC=6 RST=7 BUSY=10，唤醒=1，ADC=0 */
     [GPIO_PRESET_BOARD]   = { { 0, 1, 4, 3, 5, 6, 7, 10 } },
 };
