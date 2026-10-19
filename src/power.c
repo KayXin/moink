@@ -125,6 +125,23 @@ void power_enter_deep_sleep(void)
     esp_deep_sleep_start();
 }
 
+void power_self_lock_off(void)
+{
+    ESP_LOGW(TAG, "timeout action = off: release self-lock GPIO%d", PIN_SELF_LOCK);
+
+    /* 自锁 = MOS 一键开机：GPIO2 输出高 → MOS 导通维持供电，拉低即断电。
+       有自锁电路时约 100 ms 内失电，下面的代码不会执行到。 */
+    gpio_set_direction((gpio_num_t)PIN_SELF_LOCK, GPIO_MODE_OUTPUT);
+    gpio_set_level((gpio_num_t)PIN_SELF_LOCK, 0);
+
+    /* 无自锁电路（USB 供电 / 未装 MOS）时拉低无效：1 s 后退回深睡，
+       避免设备一直空转耗电（此时 hold 会锁住低电平，MOS 若存在仍保持关断）。 */
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    ESP_LOGW(TAG, "self-lock low did not cut power (no self-lock circuit?), "
+                  "fallback to deep sleep");
+    power_enter_deep_sleep();
+}
+
 int power_battery_mv(void)
 {
     /* 电池未连接检测：ADC 引脚悬空时读数靠杂散耦合乱漂（实测 3.2/3.3/17.6V 交替，

@@ -18,6 +18,7 @@ const netifAp = fs.readFileSync(path.join(__dirname, "..", "src", "netif_ap.c"),
 const settingsH = fs.readFileSync(path.join(__dirname, "..", "src", "settings.h"), "utf8");
 const epdDrvC = fs.readFileSync(path.join(__dirname, "..", "src", "epd_drv.c"), "utf8");
 const mainC = fs.readFileSync(path.join(__dirname, "..", "src", "main.c"), "utf8");
+const powerC = fs.readFileSync(path.join(__dirname, "..", "src", "power.c"), "utf8");
 // 版本号动态取自 version.h，避免每次升版都要改断言
 const versionH = fs.readFileSync(path.join(__dirname, "..", "src", "version.h"), "utf8");
 const VER = (/#define\s+MOINK_VERSION\s+"([^"]+)"/.exec(versionH) || [])[1] || "";
@@ -343,9 +344,26 @@ ok("R1.3.0 固件侧：store 保存/读取/删除/清空 四件套",
 ok("R1.3.0 固件侧：缩略上限统一 STORE_THUMB_JPEG_MAX",
    storeH.indexOf("#define STORE_THUMB_JPEG_MAX 20000u") >= 0
    && frameC.indexOf("STORE_THUMB_JPEG_MAX") >= 0 && storeC.indexOf("STORE_THUMB_JPEG_MAX") >= 0);
-ok("R1.3.0 固件侧：按键短按切图 + 唤醒即切图",
-   mainC.indexOf("static void carousel_next(void)") >= 0
-   && mainC.indexOf("s_woken_by_btn") >= 0 && mainC.indexOf("frame_display_slot") >= 0);
+ok("R1.3.2 固件侧：按键消抖 + 单击/双击 + 20 s 长按",
+   mainC.indexOf("#define HOLD_RESET_S    20") >= 0
+   && mainC.indexOf("#define BTN_SAMPLE_MS     20") >= 0
+   && mainC.indexOf("#define BTN_DEBOUNCE_N    3") >= 0
+   && mainC.indexOf("#define BTN_DOUBLE_MS     400") >= 0
+   && mainC.indexOf("if (++agree >= BTN_DEBOUNCE_N && stable != raw)") >= 0);
+ok("R1.3.2 固件侧：刷屏与按键解耦（UI 队列 + display_task）",
+   mainC.indexOf("static void display_task(void *arg)") >= 0
+   && mainC.indexOf("static void ui_post(ui_event_t ev)") >= 0
+   && mainC.indexOf("UI_EV_CAROUSEL_NEXT") >= 0
+   && mainC.indexOf("xQueueCreate(UI_QUEUE_LEN") >= 0
+   && mainC.indexOf("xQueueReceive(s_ui_q") >= 0);
+ok("R1.3.2 固件侧：旧「唤醒即切图 / pending 未清」逻辑已移除",
+   mainC.indexOf("bool pending = s_woken_by_btn") < 0
+   && mainC.indexOf("waiting") < 0
+   && mainC.indexOf("btn: single click (wake only)") >= 0);
+ok("R1.3.2 固件侧：按键任务早于 store_init、display_task 最后启动",
+   mainC.indexOf("xTaskCreate(button_task") >= 0
+   && mainC.indexOf("xTaskCreate(button_task") < mainC.indexOf("store_init();")
+   && mainC.indexOf("xTaskCreate(display_task") > mainC.indexOf("start_server()"));
 ok("R1.3.0 页面：图库卡片 + 大图预览层元素",
    page.indexOf('id="galGrid"') >= 0 && page.indexOf('id="carouselClear"') >= 0
    && page.indexOf('id="prevOverlay"') >= 0 && page.indexOf('id="prevCanvas"') >= 0
@@ -357,6 +375,58 @@ ok("R1.3.0 页面：「仅上传」按钮 + 双语义上传（save=1 / noshow=1�
    && js.indexOf('"/api/frame?save=1&noshow=1"') >= 0);
 ok("R1.3.0 页面：轮播满 8 的 507 提示",
    js.indexOf("xhr.status === 507") >= 0 && js.indexOf("轮播已满 8 张") >= 0);
+ok("R1.3.2 固件侧：carousel_next 只在 display_task 中调用一次",
+   (mainC.split("carousel_next();").length - 1) === 1);
+ok("R1.3.2 页面：双击切图 / 长按 20 秒文案",
+   page.indexOf("双击设备按键") >= 0 && page.indexOf("长按 20 秒") >= 0
+   && page.indexOf("长按 5 秒") < 0 && page.indexOf("短按设备按键") < 0);
+ok("R1.3.2 契约：已记录按键动作与刷屏解耦",
+   contract.indexOf("### 5.1 按键动作与刷屏解耦") >= 0
+   && contract.indexOf("`HOLD_RESET_S`(20 s)") >= 0);
+ok("R1.3.2 固件侧：唤醒来源识别（button / timer / power_on / other）",
+   mainC.indexOf("WAKE_SRC_BUTTON") >= 0 && mainC.indexOf("WAKE_SRC_TIMER") >= 0
+   && mainC.indexOf("WAKE_SRC_POWER_ON") >= 0
+   && mainC.indexOf("wake_src_from_bits") >= 0
+   && mainC.indexOf("wake_reason") >= 0
+   && mainC.indexOf("wake_bits") >= 0);
+ok("R1.3.2 固件侧：唤醒补双击窗口收紧到 1.5 s",
+   mainC.indexOf("#define BTN_WAKE_ARM_MS   1500") >= 0
+   && mainC.indexOf("BTN_WAKE_ARM_MS   2500") < 0);
+ok("R1.3.2 固件侧：轮播元数据多键单次 commit",
+   storeC.indexOf("static int st_nvs_set_u8s(") >= 0
+   && storeC.indexOf("st_nvs_set_u8s(KEY_COUNT") >= 0
+   && (storeC.split("st_nvs_set_u8(KEY_CUR").length - 1) === 0);
+ok("R1.3.2 固件侧：carousel_next 刷屏成功后才推进 cur",
+   mainC.indexOf("if (frame_display_slot(next) != 0)") >= 0
+   && mainC.indexOf("store_meta_set(count, next);") >= 0);
+ok("R1.3.2 页面：设备信息显示「本次唤醒」",
+   page.indexOf('id="i-wake"') >= 0
+   && js.indexOf("wakeTxt") >= 0 && js.indexOf("j.wake_reason") >= 0);
+ok("R1.3.2 契约：唤醒来源已写入 §5.2 与 /api/info 字段表",
+   contract.indexOf("### 5.2 唤醒来源识别") >= 0
+   && contract.indexOf("`wake_reason`") >= 0);
+ok("R1.3.3 固件侧：超时动作（休眠 / 关机）可配",
+   settingsH.indexOf("#define SETT_ACTION_OFF") >= 0
+   && settingsH.indexOf("timeout_action") >= 0
+   && mainC.indexOf("settings_set_timeout_action") >= 0
+   && mainC.indexOf("settings_set_wake_show") >= 0);
+ok("R1.3.3 固件侧：关机 = 拉低自锁脚 GPIO2",
+   powerC.indexOf("void power_self_lock_off(void)") >= 0
+   && powerC.indexOf("gpio_set_level((gpio_num_t)PIN_SELF_LOCK, 0)") >= 0
+   && mainC.indexOf("power_self_lock_off();") >= 0);
+ok("R1.3.3 固件侧：定时唤醒自动切图（默认开）",
+   settingsC.indexOf(".wake_show   = 1") >= 0
+   && mainC.indexOf("s_wake_src == WAKE_SRC_TIMER && settings_get()->wake_show") >= 0
+   && mainC.indexOf("timer wake: auto carousel next") >= 0);
+ok("R1.3.3 页面：电源管理（超时动作 + 唤醒后切图 + 自锁提示）",
+   page.indexOf("超时动作") >= 0 && page.indexOf('id="actionSel"') >= 0
+   && page.indexOf('id="wakeShow"') >= 0 && page.indexOf("高电平自锁") >= 0
+   && js.indexOf("function syncPowerUI()") >= 0
+   && js.indexOf("timeout_action: $(\"actionSel\").value") >= 0);
+ok("R1.3.3 契约：电源管理 §5.3 与设置字段已记录",
+   contract.indexOf("### 5.3 电源管理") >= 0
+   && contract.indexOf("`timeout_action`") >= 0
+   && contract.indexOf("`wake_show`") >= 0);
 ok("R1.3.0 页面：缩略随帧上传（buildThumbJpeg + &tlen= + 缩略头 fmt=2）",
    js.indexOf("function buildThumbJpeg()") >= 0 && js.indexOf("&tlen=") >= 0
    && js.indexOf("hdr[2] = 2;") >= 0);

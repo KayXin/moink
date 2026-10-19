@@ -56,11 +56,13 @@ bool pin_cfg_valid(const pin_cfg_t *c)
 static const moink_settings_t DEFAULTS = {
     .panel       = EPD_PANEL_A0,
     .hflip       = 0,
-    .wifi_pwr    = SETT_WIFI_PWR_MID,
+    .wifi_pwr    = SETT_WIFI_PWR_LOW,   /* R1.3.3：默认改为低功率（8.5dBm） */
     .gpio_preset = GPIO_PRESET_DEFAULT,
     .pins        = { { 0, 5, 4, 6, 7, 1, 3, 10 } },   /* 与 PIN_PRESETS[0] 一致 */
     .sleep_s     = SETT_SLEEP_3MIN,
+    .timeout_action = SETT_ACTION_SLEEP,
     .wake_s      = SETT_WAKE_OFF,
+    .wake_show   = 1,        /* R1.3.3：定时唤醒后自动切图，默认开启 */
     .ap_ssid     = "",
     .ap_pass     = "",
 };
@@ -115,12 +117,16 @@ void settings_init(void)
         read_u8(PIN_KEY[i], &s_cfg.pins.v[i]);
     read_u32("sleep_s", &s_cfg.sleep_s);
     read_u32("wake_s",  &s_cfg.wake_s);
+    read_u8("to_act",   &s_cfg.timeout_action);   /* R1.3.3：无此键 = 默认休眠 */
+    read_u8("wake_show", &s_cfg.wake_show);       /* R1.3.3：无此键 = 默认开 */
     read_str("ap_ssid", s_cfg.ap_ssid, SETT_SSID_MAX);
     read_str("ap_pass", s_cfg.ap_pass, SETT_PASS_MAX);
 
     /* R1.2.0：旧值不再做兼容归一；越界一律回落到默认档。 */
     if (s_cfg.panel >= EPD_PANEL_COUNT) s_cfg.panel = DEFAULTS.panel;
     if (s_cfg.hflip) s_cfg.hflip = 1;
+    if (s_cfg.timeout_action > SETT_ACTION_OFF) s_cfg.timeout_action = SETT_ACTION_SLEEP;
+    if (s_cfg.wake_show) s_cfg.wake_show = 1;
 
     /* 引脚：预设档直接用预设表；自定义档校验失败则整体回落默认（避免半套引脚
        启动，把设备带进「屏不亮」的不可诊断状态）。 */
@@ -135,9 +141,11 @@ void settings_init(void)
         s_cfg.pins = PIN_PRESETS[s_cfg.gpio_preset];
     }
 
-    ESP_LOGI(TAG, "panel=%u hflip=%u sleep=%lus wake=%lus ssid='%s' open=%d",
+    ESP_LOGI(TAG, "panel=%u hflip=%u timeout=%lus action=%s wake=%lus wake_show=%u ssid='%s' open=%d",
              s_cfg.panel, s_cfg.hflip,
-             (unsigned long)s_cfg.sleep_s, (unsigned long)s_cfg.wake_s,
+             (unsigned long)s_cfg.sleep_s,
+             s_cfg.timeout_action == SETT_ACTION_OFF ? "off" : "sleep",
+             (unsigned long)s_cfg.wake_s, s_cfg.wake_show,
              s_cfg.ap_ssid[0] ? s_cfg.ap_ssid : "(default)",
              s_cfg.ap_pass[0] == 0);
     ESP_LOGI(TAG, "gpio preset=%u ADC=%u WAKE=%u SCK=%u MOSI=%u CS=%u DC=%u RST=%u BUSY=%u",
@@ -237,6 +245,23 @@ esp_err_t settings_set_wake(uint32_t v)
     if (v > SETT_WAKE_1D) return ESP_ERR_INVALID_ARG;
     s_cfg.wake_s = v;
     store_u32("wake_s", v);
+    settings_commit();
+    return ESP_OK;
+}
+
+esp_err_t settings_set_timeout_action(uint8_t v)
+{
+    if (v > SETT_ACTION_OFF) return ESP_ERR_INVALID_ARG;
+    s_cfg.timeout_action = v;
+    store_u8("to_act", v);
+    settings_commit();
+    return ESP_OK;
+}
+
+esp_err_t settings_set_wake_show(uint8_t v)
+{
+    s_cfg.wake_show = v ? 1 : 0;
+    store_u8("wake_show", s_cfg.wake_show);
     settings_commit();
     return ESP_OK;
 }

@@ -33,7 +33,11 @@
 #define SETT_WAKE_12H     43200
 #define SETT_WAKE_1D      86400
 
-/* WiFi 发射功率档位。高 = 18dBm；中 = 10dBm（默认）；低 = 8.5dBm（缺陷批次救急档）。 */
+/* 超时动作（R1.3.3）：空闲达到「超时」时长后执行什么。 */
+#define SETT_ACTION_SLEEP 0   /* 进入深睡（可配自动唤醒） */
+#define SETT_ACTION_OFF   1   /* 释放自锁断电（需硬件自锁电路，见 PIN_SELF_LOCK） */
+
+/* WiFi 发射功率档位。高 = 18dBm；中 = 10dBm；低 = 8.5dBm（R1.3.3 起为默认档）。 */
 #define SETT_WIFI_PWR_HIGH  0
 #define SETT_WIFI_PWR_MID   1
 #define SETT_WIFI_PWR_LOW   2
@@ -100,8 +104,10 @@ typedef struct {
     uint8_t  wifi_pwr;   /* SETT_WIFI_PWR_HIGH / MID / LOW */
     uint8_t  gpio_preset;/* GPIO_PRESET_DEFAULT / LINE / BOARD / CUSTOM */
     pin_cfg_t pins;      /* 生效引脚表（CUSTOM 时即用户所填，否则等于对应预设） */
-    uint32_t sleep_s;    /* 空闲后深睡；0 = 不休眠 */
+    uint32_t sleep_s;    /* 空闲超时时长；0 = 不超时（既不睡也不关） */
+    uint8_t  timeout_action; /* SETT_ACTION_SLEEP / SETT_ACTION_OFF（R1.3.3） */
     uint32_t wake_s;     /* 定时自动唤醒间隔；0 = 关闭 */
+    uint8_t  wake_show;  /* 定时唤醒后自动切到下一张；1 = 是（默认，R1.3.3） */
     char     ap_ssid[SETT_SSID_MAX];  /* 空 = 用默认 MoInk-XXXX */
     char     ap_pass[SETT_PASS_MAX];  /* 空 = 热点开放 */
 } moink_settings_t;
@@ -115,6 +121,10 @@ esp_err_t settings_set_hflip(uint8_t v);
 esp_err_t settings_set_wifi_pwr(uint8_t v);
 esp_err_t settings_set_sleep(uint32_t v);
 esp_err_t settings_set_wake(uint32_t v);
+/* R1.3.3：空闲超时后的动作（休眠 / 关机断电）。 */
+esp_err_t settings_set_timeout_action(uint8_t v);
+/* R1.3.3：定时唤醒后是否自动切图（默认 1）。 */
+esp_err_t settings_set_wake_show(uint8_t v);
 /*
  * 设置引脚。preset 取 GPIO_PRESET_*：
  *   0/1/2 从固定预设表取（custom 被忽略）；

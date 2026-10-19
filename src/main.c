@@ -40,6 +40,7 @@
 #include "esp_http_server.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 
 #include "version.h"
 #include "epd_drv.h"
@@ -55,14 +56,53 @@
 
 static const char *TAG = "main";
 
-#define HOLD_RESET_S    5          /* 长按恢复出厂 */
+#define HOLD_RESET_S    20         /* 长按恢复出厂（R1.3.2：5 s -> 20 s） */
 #define HTTPD_STACK     8192       /* R1.3.1：轮播 list 组装 base64 需要更大栈 */
 #define HTTPD_MAX_URI   32         /* R1.3.1：16 条业务路由 + OTA + captive 兜底约 19 个，
                                        默认 8 会满（ESP_ERR_HTTPD_HANDLERS_FULL → abort 循环） */
 
-/* R1.3.0：GPIO 唤醒 = 用户按过键。唤醒的这次按下也算一次短按（切图），
-   由 button_task 消费（见其注释）。 */
-static bool s_woken_by_btn = false;
+/* ---------------- 按键识别参数（R1.3.2） ----------------
+   BTN_SAMPLE_MS 采样周期；BTN_DEBOUNCE_N 次一致才认电平变化（60 ms 消抖）。
+   BTN_DOUBLE_MS 双击第二击的间隔上限；BTN_WAKE_ARM_MS 唤醒宽限窗口（见 button_task）。 */
+#define BTN_SAMPLE_MS     20
+#define BTN_DEBOUNCE_N    3
+#define BTN_DOUBLE_MS     400
+#define BTN_WAKE_ARM_MS   1500     /* 唤醒后补认双击的窗口（R1.3.2：2.5 s -> 1.5 s） */
+#define UI_QUEUE_LEN      4
+
+/* ---------------- 本次启动的唤醒来源（R1.3.2） ----------------
+   深睡唤醒每次都会重跑 app_main，所以这里记录的就是「本次醒来」的原因；
+   设备持续运行期间保持不变。后续按来源分流功能（例如定时唤醒自动轮播、
+   按键唤醒才响应双击）统一读 wake_src()，不要再各自调 esp_sleep_*，
+   避免多处判断分叉。 */
+typedef enum {
+    WAKE_SRC_POWER_ON = 0,   /* 上电 / 复位 / OTA 重启：并非从深睡醒来 */
+    WAKE_SRC_BUTTON,         /* 按键（GPIO）唤醒 */
+    WAKE_SRC_TIMER,          /* RTC 定时自动唤醒 */
+    WAKE_SRC_OTHER,          /* 其他唤醒源（预留） */
+} wake_src_t;
+
+static wake_src_t s_wake_src  = WAKE_SRC_POWER_ON;
+static uint32_t   s_wake_bits = 0;
+
+/* 位图 -> 单一来源。两源同时命中时按键优先：用户在场，按键语义更该生效。 */
+static wake_src_t wake_src_from_bits(uint32_t bits)
+{
+    if (bits & (1u << ESP_SLEEP_WAKEUP_GPIO))  return WAKE_SRC_BUTTON;
+    if (bits & (1u << ESP_SLEEP_WAKEUP_TIMER)) return WAKE_SRC_TIMER;
+    if (bits == 0)                             return WAKE_SRC_POWER_ON;
+    return WAKE_SRC_OTHER;
+}
+
+static const char *wake_src_name(wake_src_t s)
+{
+    switch (s) {
+    case WAKE_SRC_BUTTON: return "button";
+    case WAKE_SRC_TIMER:  return "timer";
+    case WAKE_SRC_OTHER:  return "other";
+    default:              return "power_on";
+    }
+}
 
 /* ---------------- 请求小工具 ---------------- */
 
@@ -152,13 +192,14 @@ static esp_err_t info_handler(httpd_req_t *req)
 {
     power_activity();
     const moink_settings_t *s = settings_get();
-    char buf[512];
+    char buf[640];
 
     /* ver = 统一版本号 = 当前生效页面版本（热更页优先，否则等于固件编译号）。
        fw  = 固件编译进去的号：仅供排障，以及判断「热更控制页是否落后于固件」
              （ver < fw 时页面给黄色警示），界面只显示 ver。
        api 仍是帧格式契约号，与发布版本号解耦，页面状态栏另起一行显示。
-       store_slots / store_count / store_cur：轮播容量与当前状态（R1.3.0）。 */
+       store_slots / store_count / store_cur：轮播容量与当前状态（R1.3.0）。
+       wake_reason / wake_bits：本次启动的唤醒来源（R1.3.2），见 wake_src_t。 */
     int caro_count = 0, caro_cur = 0;
     store_meta_get(&caro_count, &caro_cur);
     int n = snprintf(buf, sizeof(buf),
@@ -166,14 +207,16 @@ static esp_err_t info_handler(httpd_req_t *req)
         "\"panel\":\"%s\",\"gpio_preset\":%u,\"heap\":%lu,\"bat_mv\":%d,"
         "\"sleep_s\":%lu,\"wake_s\":%lu,\"clients\":%d,"
         "\"ssid\":\"%s\",\"uptime\":%lld,\"store_slots\":%d,"
-        "\"store_count\":%d,\"store_cur\":%d}",
+        "\"store_count\":%d,\"store_cur\":%d,"
+        "\"wake_reason\":\"%s\",\"wake_bits\":%lu}",
         ota_web_page_version(), MOINK_VERSION, MOINK_API_VERSION,
         epd_panel_name((epd_panel_t)s->panel), (unsigned)s->gpio_preset,
         (unsigned long)esp_get_free_heap_size(), power_battery_mv(),
         (unsigned long)s->sleep_s, (unsigned long)s->wake_s,
         netif_ap_client_count(), netif_ap_ssid(),
         (long long)(esp_timer_get_time() / 1000000), store_slots(),
-        caro_count, caro_cur);
+        caro_count, caro_cur,
+        wake_src_name(s_wake_src), (unsigned long)s_wake_bits);
     if (n < 0 || n >= (int)sizeof(buf)) buf[sizeof(buf) - 1] = '\0';
 
     httpd_resp_set_type(req, "application/json");
@@ -186,16 +229,18 @@ static esp_err_t settings_get_handler(httpd_req_t *req)
 {
     power_activity();
     const moink_settings_t *s = settings_get();
-    char buf[512];
+    char buf[640];
 
     snprintf(buf, sizeof(buf),
         "{\"panel\":%u,\"hflip\":%u,\"wifi_pwr\":%u,\"gpio_preset\":%u,"
         "\"pins\":[%u,%u,%u,%u,%u,%u,%u,%u],"
-        "\"sleep_s\":%lu,\"wake_s\":%lu,\"ssid\":\"%s\",\"pass_set\":%s}",
+        "\"sleep_s\":%lu,\"timeout_action\":%u,\"wake_s\":%lu,\"wake_show\":%u,"
+        "\"ssid\":\"%s\",\"pass_set\":%s}",
         s->panel, s->hflip, s->wifi_pwr, s->gpio_preset,
         s->pins.v[0], s->pins.v[1], s->pins.v[2], s->pins.v[3],
         s->pins.v[4], s->pins.v[5], s->pins.v[6], s->pins.v[7],
-        (unsigned long)s->sleep_s, (unsigned long)s->wake_s,
+        (unsigned long)s->sleep_s, s->timeout_action,
+        (unsigned long)s->wake_s, s->wake_show,
         s->ap_ssid, s->ap_pass[0] ? "true" : "false");
 
     httpd_resp_set_type(req, "application/json");
@@ -265,8 +310,14 @@ static esp_err_t settings_post_handler(httpd_req_t *req)
     if (kv_get(body, "sleep_s", v, sizeof(v))) {
         settings_set_sleep((uint32_t)atoi(v));
     }
+    if (kv_get(body, "timeout_action", v, sizeof(v))) {
+        settings_set_timeout_action((uint8_t)atoi(v));
+    }
     if (kv_get(body, "wake_s", v, sizeof(v))) {
         settings_set_wake((uint32_t)atoi(v));
+    }
+    if (kv_get(body, "wake_show", v, sizeof(v))) {
+        settings_set_wake_show((uint8_t)atoi(v));
     }
 
     /* 热点凭据（FB-014①）：单字段可改 —— pass 键缺省 = 保持当前密码，
@@ -644,65 +695,179 @@ static void idle_monitor_task(void *arg)
     (void)arg;
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(1000));
-        if (power_should_sleep()) {
-            power_enter_deep_sleep();   /* 不返回 */
+        if (!power_should_sleep()) continue;
+        /* 超时动作（R1.3.3）：默认休眠；选「关机」则释放自锁断电。
+           两条路径都不返回。 */
+        if (settings_get()->timeout_action == SETT_ACTION_OFF) {
+            power_self_lock_off();
         }
+        power_enter_deep_sleep();
+    }
+}
+
+/* ---------------- 显示事件队列（R1.3.2） ----------------
+   按键等触发源只负责「投事件」，刷屏统一由 display_task 串行执行。
+   这样按键采样不会被 2~4 s 的整屏刷新阻塞（长按计时才准），
+   后续新增其它刷屏触发源（定时轮播、页面按钮、传感器等）
+   也只需 ui_post() 一个事件，不必碰按键逻辑。 */
+typedef enum {
+    UI_EV_CAROUSEL_NEXT = 0,     /* 切到下一张轮播 */
+} ui_event_t;
+
+static QueueHandle_t s_ui_q = NULL;
+
+static void ui_post(ui_event_t ev)
+{
+    if (!s_ui_q) return;
+    if (xQueueSend(s_ui_q, &ev, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "ui queue full, drop event %d", (int)ev);
     }
 }
 
 /* R1.3.0 轮播：切到下一张（读 store 槽并整屏显示）。count<=1 时无动作。
-   切图后刷新活动计时，避免刚切完就被空闲深睡。 */
+   R1.3.2：只在 display_task 里调用，与按键采样彻底解耦。
+   刷屏前先刷新活动计时：整屏刷新耗时 2~4 s，避免刚起手就撞上空闲深睡。 */
 static void carousel_next(void)
 {
     int count = 0, cur = 0;
     store_meta_get(&count, &cur);
     if (count <= 0) return;
-    cur = (cur + 1) % count;
-    store_meta_set(count, cur);
-    ESP_LOGI(TAG, "carousel: next -> slot %d (count %d)", cur, count);
-    if (frame_display_slot(cur) == 0) {
+
+    int next = (cur + 1) % count;
+    power_activity();
+    if (frame_display_slot(next) != 0) {
+        /* R1.3.2：刷屏失败不推进 cur，否则下次按键会「跳过一张」。
+           旧实现先写 NVS 再刷屏，失败也照样前移。 */
+        ESP_LOGW(TAG, "carousel: slot %d display failed, keep cur %d", next, cur);
+        return;
+    }
+    store_meta_set(count, next);
+    ESP_LOGI(TAG, "carousel: next -> slot %d (count %d)", next, count);
+}
+
+/* R1.3.2 显示任务：固件里唯一执行「UI 触发刷屏」的任务（按键动作经队列进到这里）。
+   上传帧的刷屏仍走 frame_task，两者由帧缓冲互斥量串行。 */
+static void display_task(void *arg)
+{
+    (void)arg;
+    if (s_ui_q == NULL) {
+        ESP_LOGE(TAG, "no ui queue, display task exits");
+        vTaskDelete(NULL);
+        return;
+    }
+    ui_event_t ev;
+    for (;;) {
+        if (xQueueReceive(s_ui_q, &ev, portMAX_DELAY) != pdTRUE) continue;
+        switch (ev) {
+        case UI_EV_CAROUSEL_NEXT:
+            carousel_next();
+            break;
+        default:
+            break;
+        }
         power_activity();
     }
 }
 
+/* ---------------- 按键识别（R1.3.2 重写） ----------------
+   只做识别，不做任何刷屏动作；与刷屏解耦后采样不会被整屏刷新阻塞。
+
+   动作定义：
+     单击  按下-松开，BTN_DOUBLE_MS 内没有第二击 → 只唤醒（重置空闲计时），不刷图
+     双击  两次按下间隔 ≤ BTN_DOUBLE_MS        → 投 UI_EV_CAROUSEL_NEXT（切图）
+     长按  持续 HOLD_RESET_S 秒                 → 恢复出厂并重启
+
+   唤醒语义：被按键唤醒时，那一击已经被「唤醒」这件事消耗掉。
+     · 任务启动瞬间键已松开 —— 第一击完整发生在启动期，
+       此后 BTN_WAKE_ARM_MS 内的第一次单击视为「第二击」，直接切图；
+     · 任务启动瞬间键仍按住 —— 按着的这一下就是第一击本身，松手只算单击。
+   注：深睡唤醒到本任务启动之间约 0.3 s 内按键无法采样，若两击都落在该窗口，
+       只能识别为单击 —— 属启动时序的物理限制。 */
 static void button_task(void *arg)
 {
     (void)arg;
     const gpio_num_t btn = (gpio_num_t)settings_pins()->v[PIN_IDX_WAKE];
-    int held = 0;
 
-    /* 唤醒语义（R1.3.0）：GPIO 唤醒 = 用户按过键。若此刻键仍按住，等它松开，
-       那次松开算一次短按；若已松开（启动慢于松手），补一次切图。 */
-    bool pending = s_woken_by_btn;
-    bool waiting = pending && (gpio_get_level(btn) == 0);
+    enum { ST_IDLE = 0, ST_DOWN, ST_WAIT_SECOND };
+    int st = ST_IDLE;
+
+    int raw_prev = gpio_get_level(btn);
+    int stable = raw_prev;
+    int agree = 0;
+    bool second = false;              /* 本次按下是双击的第二击 */
+    bool long_warned = false;
+    TickType_t t_down = 0, t_release = 0;
+
+    const bool woken_by_btn = (s_wake_src == WAKE_SRC_BUTTON);
+    bool wake_armed = woken_by_btn && (stable != 0);
+    TickType_t wake_deadline = xTaskGetTickCount() + pdMS_TO_TICKS(BTN_WAKE_ARM_MS);
+    if (woken_by_btn) {
+        ESP_LOGI(TAG, "btn: woken by key, level %s",
+                 stable == 0 ? "low(held)" : "high(released)");
+    }
 
     for (;;) {
-        vTaskDelay(pdMS_TO_TICKS(50));
-        bool down = (gpio_get_level(btn) == 0);
-        if (down) {
-            held++;
-            if (held == HOLD_RESET_S * 20) {
-                ESP_LOGW(TAG, "wake button held, keep holding %ds to factory reset", HOLD_RESET_S);
+        vTaskDelay(pdMS_TO_TICKS(BTN_SAMPLE_MS));
+        TickType_t now = xTaskGetTickCount();
+        int raw = gpio_get_level(btn);
+
+        /* 消抖：同一电平连续 BTN_DEBOUNCE_N 次采样才认为稳定 */
+        if (raw != raw_prev) {
+            raw_prev = raw;
+            agree = 0;
+        } else if (++agree >= BTN_DEBOUNCE_N && stable != raw) {
+            stable = raw;
+            agree = 0;
+            if (stable == 0) {
+                /* 按下沿 */
+                t_down = now;
+                long_warned = false;
+                second = (st == ST_WAIT_SECOND);
+                st = ST_DOWN;
+            } else if (st == ST_DOWN) {
+                /* 松开沿 */
+                if (second) {
+                    second = false;
+                    st = ST_IDLE;
+                    ESP_LOGI(TAG, "btn: double click -> carousel next");
+                    ui_post(UI_EV_CAROUSEL_NEXT);
+                } else if (wake_armed) {
+                    wake_armed = false;
+                    st = ST_IDLE;
+                    ESP_LOGI(TAG, "btn: wake + click -> carousel next");
+                    ui_post(UI_EV_CAROUSEL_NEXT);
+                } else {
+                    st = ST_WAIT_SECOND;
+                    t_release = now;
+                }
             }
-            if (held >= HOLD_RESET_S * 20 + 5) {
-                ESP_LOGW(TAG, "long press: factory reset + reboot");
+        }
+
+        if (st == ST_DOWN) {
+            /* 按住期间持续刷新活动计时：否则空闲休眠可能先把设备睡掉，
+               20 s 长按永远走不完。 */
+            power_activity();
+            TickType_t held = now - t_down;
+            if (!long_warned && held >= pdMS_TO_TICKS((HOLD_RESET_S - 3) * 1000)) {
+                long_warned = true;
+                ESP_LOGW(TAG, "keep holding %d s more to factory reset", 3);
+            }
+            if (held >= pdMS_TO_TICKS(HOLD_RESET_S * 1000)) {
+                ESP_LOGW(TAG, "long press %d s: factory reset + reboot", HOLD_RESET_S);
                 settings_factory_reset();
                 vTaskDelay(pdMS_TO_TICKS(300));
                 esp_restart();
             }
-        } else {
-            if (held > 0) {
-                /* 刚松开：<5s 视为短按（含唤醒那次），切下一张 */
-                if (held < HOLD_RESET_S * 20) {
-                    if (waiting) waiting = false;
-                    carousel_next();
-                }
-                held = 0;
-            } else if (pending && !waiting) {
-                /* 唤醒瞬间键已松开：补一次切图 */
-                pending = false;
-                carousel_next();
+        } else if (st == ST_WAIT_SECOND) {
+            if ((now - t_release) >= pdMS_TO_TICKS(BTN_DOUBLE_MS)) {
+                st = ST_IDLE;
+                ESP_LOGI(TAG, "btn: single click (wake only)");
+                power_activity();       /* 单击也算有人在用：重置空闲计时 */
             }
+        }
+
+        if (wake_armed && (int32_t)(now - wake_deadline) >= 0) {
+            wake_armed = false;
         }
     }
 }
@@ -734,21 +899,38 @@ void app_main(void)
 
     settings_init();
 
-    /* 唤醒原因：GPIO = 按键，TIMER = 定时自动唤醒。放在 settings_init() 之后，
-       日志才能打出运行时解析出的唤醒脚。 */
-    uint32_t wake = power_wakeup_causes();
-    bool auto_wake = (wake & (1u << ESP_SLEEP_WAKEUP_TIMER)) != 0;
-    power_set_auto_wake(auto_wake);
-    if (wake & (1u << ESP_SLEEP_WAKEUP_GPIO)) {
-        ESP_LOGI(TAG, "woken by GPIO%u button", settings_pins()->v[PIN_IDX_WAKE]);
-        s_woken_by_btn = true;   /* R1.3.0：唤醒的这次按下也算一次短按（切图） */
-    } else if (auto_wake) {
-        ESP_LOGI(TAG, "woken by RTC timer (auto wake)");
-    } else if (wake) {
-        ESP_LOGI(TAG, "wakeup bitmap 0x%lx", (unsigned long)wake);
+    /* 唤醒来源：GPIO = 按键，TIMER = 定时自动唤醒，位图 0 = 上电/复位。
+       放在 settings_init() 之后，日志才能打出运行时解析出的唤醒脚。 */
+    s_wake_bits = power_wakeup_causes();
+    s_wake_src  = wake_src_from_bits(s_wake_bits);
+    power_set_auto_wake(s_wake_src == WAKE_SRC_TIMER);
+    switch (s_wake_src) {
+    case WAKE_SRC_BUTTON:
+        ESP_LOGI(TAG, "wake src: button (GPIO%u)", settings_pins()->v[PIN_IDX_WAKE]);
+        /* 这一击只用于唤醒、不自动切图；语义见 button_task 顶部注释。 */
+        break;
+    case WAKE_SRC_TIMER:
+        ESP_LOGI(TAG, "wake src: timer (auto wake)");
+        break;
+    case WAKE_SRC_POWER_ON:
+        ESP_LOGI(TAG, "wake src: power-on/reset (reset reason %d)",
+                 (int)esp_reset_reason());
+        break;
+    default:
+        ESP_LOGI(TAG, "wake src: other (bits 0x%lx)", (unsigned long)s_wake_bits);
+        break;
     }
 
-    power_init();
+    power_init();       /* 配好按键脚与电池 ADC，按键任务依赖它 */
+
+    /* 按键识别尽早启动（上电后约 0.3 s）：双击的第二击才来得及被采样到。
+       本任务只投事件、不刷屏，display_task 就绪前投来的事件先在队列里排着。 */
+    s_ui_q = xQueueCreate(UI_QUEUE_LEN, sizeof(ui_event_t));
+    if (s_ui_q == NULL) {
+        ESP_LOGE(TAG, "ui queue create failed");
+    }
+    xTaskCreate(button_task, "button", 3072, NULL, 6, NULL);
+
     store_init();       /* 轮播存储底座（FB-017 第一部分）：只探测，不写入 */
 
     if (epd_init() != 0) {
@@ -767,7 +949,15 @@ void app_main(void)
 
     xTaskCreate(frame_task, "frame", 4096, NULL, 5, NULL);
     xTaskCreate(idle_monitor_task, "idle_mon", 3072, NULL, 4, NULL);
-    xTaskCreate(button_task, "button", 3072, NULL, 4, NULL);
+    /* 刷屏任务最后启动：store / epd / frame 全部就绪后才可能消费到切图事件 */
+    xTaskCreate(display_task, "display", 4096, NULL, 4, NULL);
+
+    /* R1.3.3：定时唤醒后自动切到下一张（默认开启，页面可关）。
+       事件先入队，display_task 起来即消费；图库为空时 carousel_next 自行返回。 */
+    if (s_wake_src == WAKE_SRC_TIMER && settings_get()->wake_show) {
+        ESP_LOGI(TAG, "timer wake: auto carousel next");
+        ui_post(UI_EV_CAROUSEL_NEXT);
+    }
 
     ota_web_confirm();
 

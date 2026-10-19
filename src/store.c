@@ -61,6 +61,25 @@ static int st_nvs_set_u8(const char *k, uint8_t v)
     return (e == ESP_OK) ? 0 : -1;
 }
 
+/* R1.3.2：多键一次提交（k2/k3 传 NULL 表示没有更多键）。
+   原来 cnt / cur 各走一次 st_nvs_set_u8，每次切图要 2 次 NVS commit，
+   长期按键轮播会明显增加擦写磨损；而且两次提交之间掉电会留下
+   「count 已变、cur 还是旧值」的半套状态。 */
+static int st_nvs_set_u8s(const char *k1, uint8_t v1,
+                          const char *k2, uint8_t v2,
+                          const char *k3, uint8_t v3)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return -1;
+    esp_err_t e = nvs_set_u8(h, k1, v1);
+    if (e == ESP_OK && k2) e = nvs_set_u8(h, k2, v2);
+    if (e == ESP_OK && k3) e = nvs_set_u8(h, k3, v3);
+    if (e == ESP_OK) e = nvs_commit(h);
+    nvs_close(h);
+    if (e != ESP_OK) ESP_LOGW(TAG, "nvs meta write failed: %s", esp_err_to_name(e));
+    return (e == ESP_OK) ? 0 : -1;
+}
+
 /* ---------------- 初始化 ---------------- */
 
 void store_init(void)
@@ -119,8 +138,7 @@ void store_meta_set(int count, int cur)
 {
     if (count < 0 || count > STORE_SLOT_MAX) return;
     if (cur < 0 || cur >= count) cur = 0;
-    st_nvs_set_u8(KEY_COUNT, (uint8_t)count);
-    st_nvs_set_u8(KEY_CUR, (uint8_t)cur);
+    st_nvs_set_u8s(KEY_COUNT, (uint8_t)count, KEY_CUR, (uint8_t)cur, NULL, 0);
 }
 
 /* ---------------- 读写 ---------------- */
@@ -177,8 +195,7 @@ int store_save_frame(const uint8_t *hdr, uint32_t hdr_len,
         return -1;
     }
 
-    st_nvs_set_u8(KEY_COUNT, cnt + 1);
-    st_nvs_set_u8(KEY_CUR, (uint8_t)slot);
+    st_nvs_set_u8s(KEY_COUNT, (uint8_t)(cnt + 1), KEY_CUR, (uint8_t)slot, NULL, 0);
 
     xSemaphoreGive(s_lock);
     ESP_LOGI(TAG, "saved frame -> slot %d (count=%u)", slot, cnt + 1);
@@ -247,8 +264,7 @@ int store_delete_slot(int slot)
         if (slot < (int)cur) ncur = (uint8_t)(cur - 1);
         else if (slot == (int)cur)
             ncur = (nc == 0) ? 0 : (uint8_t)((cur >= nc) ? nc - 1 : cur);
-        st_nvs_set_u8(KEY_COUNT, nc);
-        st_nvs_set_u8(KEY_CUR, ncur);
+        st_nvs_set_u8s(KEY_COUNT, nc, KEY_CUR, ncur, NULL, 0);
         ESP_LOGI(TAG, "deleted slot %d -> count=%u cur=%u", slot, nc, ncur);
     }
 
@@ -452,8 +468,6 @@ int store_load_thumb(int slot, uint8_t *out, uint32_t cap)
 
 void store_clear(void)
 {
-    st_nvs_set_u8(KEY_COUNT, 0);
-    st_nvs_set_u8(KEY_CUR, 0);
-    st_nvs_set_u8(KEY_WIDX, 0);
+    st_nvs_set_u8s(KEY_COUNT, 0, KEY_CUR, 0, KEY_WIDX, 0);
     ESP_LOGI(TAG, "carousel cleared (metadata only, slots left for rotation)");
 }

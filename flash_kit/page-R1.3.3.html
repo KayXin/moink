@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="moink-page-version" content="R1.3.1">
+<meta name="moink-page-version" content="R1.3.3">
 <title>墨印 · MoInk</title>
 <style>
 /* ===== Cropper.js v1.6.2 | MIT | https://github.com/fengyuanchen/cropperjs ===== */
@@ -375,7 +375,7 @@ details summary{ cursor:pointer; font-weight:600; font-size:14px; color:var(--in
   <section class="card" id="galleryCard">
     <h3>设备轮播图库<span class="tag">最多 8 张</span></h3>
     <div class="hint">用上方「上传并刷新屏幕」添加轮播图，可先编辑再上传；满 8 张后需先删除或清空。
-      点击缩略图看大图，点 × 删除该张。<b>短按设备按键</b>循环切换（长按 5 秒恢复出厂）。</div>
+      点击缩略图看大图，点 × 删除该张。<b>双击设备按键</b>切到下一张（单击只唤醒、不切图；长按 20 秒恢复出厂）。</div>
     <div class="galGrid" id="galGrid"></div>
     <div class="row">
       <button class="mini" id="carouselClear">清空轮播</button>
@@ -398,32 +398,51 @@ details summary{ cursor:pointer; font-weight:600; font-size:14px; color:var(--in
       <div><span>空闲内存</span><b id="i-heap">—</b></div>
       <div><span>电池</span><b id="i-bat">—</b></div>
       <div><span>在线设备</span><b id="i-clients">—</b></div>
+      <div><span>本次唤醒</span><b id="i-wake">—</b></div>
     </div>
 
     <details>
-      <summary>休眠与唤醒</summary>
+      <summary>电源管理</summary>
     <div class="row">
-      <label>休眠</label>
+      <label>超时</label>
       <select id="sleepSel">
         <option value="60">1 分钟</option>
         <option value="180">3 分钟</option>
         <option value="300">5 分钟</option>
-        <option value="0">不休眠</option>
+        <option value="0">不超时</option>
       </select>
+      <span class="hint" style="margin:0">无操作达到此时长后执行下面的动作</span>
     </div>
     <div class="row">
-      <label>自动唤醒</label>
-      <select id="wakeSel">
-        <option value="0">关闭</option>
-        <option value="3600">每 1 小时</option>
-        <option value="43200">每 12 小时</option>
-        <option value="86400">每 1 天</option>
+      <label>超时动作</label>
+      <select id="actionSel">
+        <option value="0">休眠</option>
+        <option value="1">关机（断电）</option>
       </select>
-      <span class="hint" style="margin:0">醒来开热点等人传图（3 分钟）</span>
+    </div>
+    <div id="sleepOpts">
+      <div class="row">
+        <label>自动唤醒</label>
+        <select id="wakeSel">
+          <option value="0">关闭</option>
+          <option value="3600">每 1 小时</option>
+          <option value="43200">每 12 小时</option>
+          <option value="86400">每 1 天</option>
+        </select>
+        <span class="hint" style="margin:0">醒来开热点等人传图（3 分钟）</span>
+      </div>
+      <div class="row">
+        <label>唤醒后切图</label>
+        <span><input type="checkbox" id="wakeShow"> 定时唤醒后自动切到下一张</span>
+      </div>
     </div>
     <div class="row">
-      <button class="mini" id="saveSleep">保存休眠设置</button>
+      <button class="mini" id="saveSleep">保存电源设置</button>
       <span class="savestate" id="sleepmsg"></span>
+    </div>
+    <div class="hint">
+      「关机」靠 <b>GPIO2 输出高电平自锁</b>实现：断电时把该脚拉低、切断 MOS 供电。
+      <b>板上没有自锁电路就无法真正断电</b>（会退回休眠）。超时设为「不超时」时两个动作都不执行。
     </div>
     </details>
 
@@ -445,10 +464,10 @@ details summary{ cursor:pointer; font-weight:600; font-size:14px; color:var(--in
       <label>WiFi 功率</label>
       <select id="wifiPwrSel">
         <option value="0">高（18dBm）</option>
-        <option value="1">中（10dBm，默认）</option>
-        <option value="2">低（8.5dBm）</option>
+        <option value="1">中（10dBm）</option>
+        <option value="2">低（8.5dBm，默认）</option>
       </select>
-      <span class="hint" style="margin:0">连不上/传输不稳时再调低</span>
+      <span class="hint" style="margin:0">连不上 / 传输不稳时调高</span>
     </div>
     <div class="row"><button class="mini" id="saveAp">保存热点设置</button><span class="savestate" id="apmsg"></span></div>
     </details>
@@ -490,7 +509,7 @@ details summary{ cursor:pointer; font-weight:600; font-size:14px; color:var(--in
       <button class="mini" id="saveGpioReboot">保存并重启</button>
       <span class="savestate" id="gpiomsg"></span>
     </div>
-    <div class="hint">引脚改动<b>需重启才生效</b>（SPI 总线按引脚在启动时初始化）。改错导致屏不亮时，按住唤醒键 5 秒可恢复出厂。</div>
+    <div class="hint">引脚改动<b>需重启才生效</b>（SPI 总线按引脚在启动时初始化）。改错导致屏不亮时，按住唤醒键 20 秒可恢复出厂。</div>
     </details>
 
     <details>
@@ -2338,6 +2357,9 @@ function refreshInfo(){
     $("i-heap").textContent = j.heap != null ? (j.heap/1024).toFixed(0) + " KB" : "—";
     $("i-bat").textContent = (j.bat_mv > 0) ? (j.bat_mv/1000).toFixed(2) + " V" : "未连接";
     $("i-clients").textContent = j.clients != null ? j.clients : "—";
+    var wakeTxt = { button: "按键", timer: "定时", power_on: "上电/复位", other: "其他" };
+    $("i-wake").textContent = j.wake_reason ? (wakeTxt[j.wake_reason] || j.wake_reason) : "—";
+    $("i-wake").title = (j.wake_bits != null) ? ("唤醒位图 0x" + (+j.wake_bits).toString(16)) : "";
     var ok = (j.ssid != null);
     $("conn").textContent = ok ? ("已连接 · " + j.ssid) : "未连接";
     $("conn").classList.toggle("ok", ok);
@@ -2346,16 +2368,24 @@ function refreshInfo(){
     if (applyPanelGeom(PANEL.id)) onGeomChanged();
   }).catch(function(){ $("conn").textContent = LOCAL_PREVIEW ? "本地预览（未连设备）" : "未连接"; });
 }
+function syncPowerUI(){
+  /* 超时动作 = 关机时没有「自动唤醒 / 唤醒后切图」这两项。 */
+  var off = $("actionSel").value === "1";
+  $("sleepOpts").style.display = off ? "none" : "";
+}
 function loadSettings(){
   fetch(api("/api/settings")).then(function(r){ return r.json(); }).then(function(s){
     $("sleepSel").value = String(s.sleep_s);
+    $("actionSel").value = String(s.timeout_action == null ? 0 : s.timeout_action);
     $("wakeSel").value = String(s.wake_s);
+    $("wakeShow").checked = (s.wake_show == null) ? true : !!s.wake_show;  /* 默认开启 */
+    syncPowerUI();
     $("apSsid").value = s.ssid || "";
     $("apPass").placeholder = s.pass_set ? "已设置（留空 = 保持当前密码）" : "留空 = 开放热点";
     $("apClearRow").style.display = s.pass_set ? "" : "none";
     $("apClearPw").checked = false;
     $("panelSel").value = String(s.panel);
-    $("wifiPwrSel").value = String(s.wifi_pwr || 0);
+    $("wifiPwrSel").value = String(s.wifi_pwr == null ? 2 : s.wifi_pwr);
     loadGpio(s);
     if (applyPanelGeom(+s.panel)) onGeomChanged();
     $("hflip").checked = !!s.hflip;
@@ -2368,7 +2398,8 @@ function loadSettings(){
    并且不轻信 "HTTP 200"：保存后回读 /api/settings 逐字段核对，确认真落进了设备。
    热点改名会立刻踢掉客户端（应答可能收不到），所以回读带重试。 */
 var SETT_LABEL = { panel:"屏幕", hflip:"左右镜像", gpio_preset:"GPIO 接法",
-                   wifi_pwr:"WiFi 功率", sleep_s:"休眠", wake_s:"自动唤醒",
+                   wifi_pwr:"WiFi 功率", sleep_s:"超时", timeout_action:"超时动作",
+                   wake_s:"自动唤醒", wake_show:"唤醒后切图",
                    ssid:"热点名", pass:"热点密码" };
 function saveState(id, kind, text){
   var el = id ? $(id) : null; if (!el) return;
@@ -2449,9 +2480,14 @@ function postSettings(fields, done, stateId, note){
   });
 }
 /* 休眠/唤醒改为显式保存（不再随下拉框变更即时保存） */
+$("actionSel").addEventListener("change", syncPowerUI);
 $("saveSleep").addEventListener("click", function(){
-  postSettings({ sleep_s: $("sleepSel").value, wake_s: $("wakeSel").value },
-               function(){ loadSettings(); }, "sleepmsg");
+  postSettings({
+    sleep_s: $("sleepSel").value,
+    timeout_action: $("actionSel").value,
+    wake_s: $("wakeSel").value,
+    wake_show: $("wakeShow").checked ? 1 : 0
+  }, function(){ loadSettings(); }, "sleepmsg");
 });
 $("saveAp").addEventListener("click", function(){
   /* FB-014①：pass 按需携带 —— 留空 = 不携带（固件保持当前密码）；

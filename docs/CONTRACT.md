@@ -2,7 +2,7 @@
 
 > 本文档是**固件与页面之间的唯一权威接口定义**，以及**屏驱动的物理契约**。
 > 改动任何一条必须同步更新 `check_frame.py` / `smoke_page.js` 并全量回归。
-> 版本：version = R1.3.1（固件与控制页共用这一个号），api = 2。
+> 版本：version = R1.3.3（固件与控制页共用这一个号），api = 2。
 
 ---
 
@@ -137,7 +137,7 @@ body = 帧头(16B) + 2bpp 帧载荷(len) + 缩略头(16B) + 缩略载荷(tlen)
 | DC | 1 | 5 | 6 | 白名单 `0..10` |
 | RST | 3 | 4 | 7 | 白名单 `0..10` |
 | BUSY | 10 | 3 | 10 | 白名单 `0..10` |
-| 唤醒键（KEY） | 5（→ GND，内部上拉、低电平唤醒；长按 5s 恢复出厂） | 1 | 1 | **仅 GPIO0..5**（RTC 深睡唤醒域） |
+| 唤醒键（KEY） | 5（→ GND，内部上拉、低电平唤醒；单击只唤醒、双击切图、长按 20s 恢复出厂） | 1 | 1 | **仅 GPIO0..5**（RTC 深睡唤醒域） |
 | 电池 ADC | 0 | 0 | 0 | **仅 GPIO0..4**（ADC1_CH0..CH4；GPIO5 为 ADC2，与 WiFi 冲突且不稳定） |
 | **自锁脚（LOCK）** | **2**（固定） | 2 | 2 | 不对外开放；MOS 一键开机，上电拉高、深睡 `gpio_hold` 保持 |
 
@@ -152,14 +152,81 @@ body = 帧头(16B) + 2bpp 帧载荷(len) + 缩略头(16B) + 缩略载荷(tlen)
 - ⚠️ 自锁脚 GPIO2 同时是 **strapping 脚**（复位瞬间被采样决定启动模式）；外部自锁电路
   应避免强拉低，正常 SPI Boot 只要求 GPIO9 = 1。
 
+### 5.1 按键动作与刷屏解耦（R1.3.2 起）
+
+唤醒键（KEY，→ GND，低电平有效）由 `button_task` 独立识别，**本身不刷屏**：识别到动作后
+只向 FreeRTOS 队列投递 UI 事件，由 `display_task` 串行消费并执行刷屏。
+
+> **为什么解耦**：整屏刷新耗时 2~4 s。若在按键任务里直接刷屏，采样会被阻塞，长按计时
+> 停摆（旧实现里 20 s 长按实际要按 22~24 s），且一次动作容易重复触发。
+> 后续新增刷屏触发源（定时轮播 / 页面按钮 / 传感器等）只需调用 `ui_post()` 投事件，
+> 不必改动按键逻辑，也不会和按键抢同一任务。
+
+| 动作 | 判定 | 结果 |
+|---|---|---|
+| 单击 | 按下-松开，`BTN_DOUBLE_MS`(400 ms) 内无第二击 | 只唤醒（重置空闲计时），**不刷图** |
+| 双击 | 两次按下的间隔 ≤ 400 ms | 投 `UI_EV_CAROUSEL_NEXT` → 切到下一张 |
+| 长按 | 持续按住 `HOLD_RESET_S`(20 s) | 恢复出厂并重启 |
+
+- 采样周期 `BTN_SAMPLE_MS = 20 ms`；同一电平**连续 `BTN_DEBOUNCE_N = 3` 次**采样一致才认为
+  稳定（约 60 ms 消抖）。机械触点弹跳不会产生重复动作。
+- 长按期间持续刷新活动计时：否则空闲休眠可能先把设备睡掉，长按永远走不完。
+- **深睡唤醒语义**：唤醒那一击只用于唤醒，**不再自动切图**。
+  - 任务启动瞬间键**已松开** → 此后 `BTN_WAKE_ARM_MS`(1.5 s) 内的首次单击视为
+    「双击的第二击」，直接切图；
+  - 任务启动瞬间键**仍按住** → 按着的这一下就是第一击本身，松手只算单击。
+  - ⚠️ 深睡唤醒到任务启动之间约 0.3 s 内无法采样；若两击都落在该窗口内，只能识别为
+    单击 —— 属启动时序的物理限制。
+- UI 事件队列深度 `UI_QUEUE_LEN = 4`，满时丢弃并打 WARN。
+- 当前 UI 事件：`UI_EV_CAROUSEL_NEXT`（切到下一张轮播）。
+
+### 5.2 唤醒来源识别（R1.3.2 起）
+
+每次深睡唤醒都会重跑 `app_main()`，所以「唤醒来源」是**本次启动**的属性，运行期间不变；
+OTA 重启、恢复出厂重启、复位都归为 `power_on`。
+
+| `wake_reason` | 含义 | `wake_bits` |
+|---|---|---|
+| `button` | 按键（GPIO）唤醒 | 含 `ESP_SLEEP_WAKEUP_GPIO` 位 |
+| `timer` | RTC 定时自动唤醒 | 含 `ESP_SLEEP_WAKEUP_TIMER` 位 |
+| `power_on` | 上电 / 复位 / OTA / 恢复出厂重启 | `0` |
+| `other` | 其他唤醒源（预留） | 其他位 |
+
+- 判定优先级：**按键 > 定时 > 其他**。两源同时命中视为按键 —— 用户在场时按键语义优先。
+- 固件内部统一读 `main.c` 的 `s_wake_src`（枚举 `wake_src_t`），别再各处直接调
+  `esp_sleep_get_wakeup_causes()`，避免判断分叉。
+- 定时唤醒同时使 `power_auto_wake()` 为真：空闲窗口缩短到 `AUTO_WAKE_WINDOW_S`（等人传图）。
+- 用途：后续按来源分流功能，例如「定时唤醒自动播下一张」只在 `timer` 时启用、
+  「双击切图」只在 `button` 时启用，都可直接判这一个值。
+
+### 5.3 电源管理：超时动作（R1.3.3 起）
+
+控制页「电源管理」把原来的「休眠时长」改称「超时」，并新增「超时动作」：空闲达到
+超时时长后，由 `idle_monitor_task` 执行所选动作。
+
+| `timeout_action` | 动作 | 说明 |
+|---|---|---|
+| `0` sleep（默认） | 深睡 | 可配 `wake_s` 定时自动唤醒；唤醒后按 `wake_show` 决定是否切图 |
+| `1` off | 关机 | 释放自锁脚断电（见下），**不区分 GPIO 接法** |
+
+- `sleep_s = 0`（不超时）时两个动作都不执行，设备常亮。
+- **关机实现**：`power_self_lock_off()` 把 GPIO2 拉低，切断 MOS 自锁供电。有自锁电路时
+  约 100 ms 掉电、函数不返回；**没有自锁电路（USB 供电 / 未装 MOS）时拉低无效**，
+  1 s 后退回深睡。⇒ 关机能力依赖硬件，控制页对此有明确提示。
+- **定时唤醒切图**：`wake_show = 1`（默认）时，`wake_reason = timer` 的启动会在
+  `display_task` 就绪后投递 `UI_EV_CAROUSEL_NEXT`，自动切到下一张；图库为空则无动作。
+  该开关只影响定时唤醒；按键唤醒仍走 §5.1 的双击语义。
+- 新 NVS 键：`to_act`（超时动作）、`wake_show`（唤醒切图）。老设备无键时取默认值
+  （休眠 / 开），升级后行为不变。
+
 ## 6. HTTP API 路由（`api = 2`）
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/` | 控制页（web 分区优先，否则内嵌页） |
-| GET | `/api/info` | 状态 JSON：**ver**/fw/api/panel/**gpio_preset**/heap/bat_mv/sleep_s/wake_s/clients/ssid/uptime/**store_slots**/**store_count**/**store_cur**（`ver` = 当前生效版本） |
-| GET | `/api/settings` | 读设置 JSON：panel/hflip/wifi_pwr/**gpio_preset**/**pins[8]**/sleep_s/wake_s/ssid/pass_set |
-| POST | `/api/settings` | 写设置（`panel`/`hflip`/`gpio_preset`（自定义档另带 `p_adc`/`p_wake`/`p_sck`/`p_mosi`/`p_cs`/`p_dc`/`p_rst`/`p_busy`）/`sleep_s`/`wake_s`；热点凭据单字段更新见 §7） |
+| GET | `/api/info` | 状态 JSON：**ver**/fw/api/panel/**gpio_preset**/heap/bat_mv/sleep_s/wake_s/clients/ssid/uptime/**store_slots**/**store_count**/**store_cur**/**wake_reason**/**wake_bits**（`ver` = 当前生效版本，`wake_reason` 见 §5.2） |
+| GET | `/api/settings` | 读设置 JSON：panel/hflip/wifi_pwr/**gpio_preset**/**pins[8]**/sleep_s/**timeout_action**/wake_s/**wake_show**/ssid/pass_set |
+| POST | `/api/settings` | 写设置（`panel`/`hflip`/`gpio_preset`（自定义档另带 `p_adc`/`p_wake`/`p_sck`/`p_mosi`/`p_cs`/`p_dc`/`p_rst`/`p_busy`）/`sleep_s`/**`timeout_action`**/`wake_s`/**`wake_show`**；热点凭据单字段更新见 §7） |
 | POST | `/api/frame` | 传图（§1 帧格式）。query：`save=1` 存轮播槽并显示、`save=1&noshow=1` 只存不显示、`tlen=N` 随帧携带缩略（§1.1）。无 `save` = 只显示不存 |
 | POST | `/api/carousel/clear` | 清空轮播：**只清 NVS 元数据、不擦 flash**（`count=0` / `cur=0`） |
 | GET | `/api/carousel/list` | 图库列表 JSON：`{slots,count,cur,items[{slot,fmt,w,h,len,data}]}`，`data` = 缩略图 base64（`fmt=2` 为彩色 JPEG，`fmt=1` 为 2bit 帧） |
@@ -201,7 +268,7 @@ body = 帧头(16B) + 2bpp 帧载荷(len) + 缩略头(16B) + 缩略载荷(tlen)
   回落 A0 驱动、排线 / 整合板接法回落默认引脚，用户升级完得重新配一遍甚至先看到「屏不亮」。
   ⚠️ **首次**从 ≤R1.2.1 升到 R1.2.2 时 NVS 里还没有 GPIO 键 → 落「默认」档，
   排线 / 整合板接法的设备需进页面选对应档并重启一次（此后升级不再复现）。
-- **恢复出厂**（长按唤醒键 5s / `POST /api/factory`）：`nvs_erase_all()` 擦除整个 `moink`
+- **恢复出厂**（长按唤醒键 20s / `POST /api/factory`）：`nvs_erase_all()` 擦除整个 `moink`
   命名空间（含 `page_ver` 热更标记，即页面一并回退内嵌版）。
 - 休眠档位（`sleep_s`）：`0`=不休眠 / `60` / `180`（默认）/ `300` 秒。
 - 定时唤醒档位（`wake_s`）：`0`=关（默认）/ `3600` / `43200` / `86400` 秒。
@@ -272,6 +339,11 @@ body = 帧头(16B) + 2bpp 帧载荷(len) + 缩略头(16B) + 缩略载荷(tlen)
   （NVS 自带磨损均衡）；store 分区内不放会被反复改写的元数据。
   「清空轮播」**只清 NVS 元数据、不擦 flash**（槽内容留待下次写入整槽覆盖）。
   延寿调研详见 `docs/调研-内置Flash延寿方案.md`。
+- **元数据写入原子性（R1.3.2）**：`count` / `cur` / `widx` 的多键更新一律走
+  `st_nvs_set_u8s()` **一次 `nvs_commit`**，不再各键各提交一次（每次切图从 2 次 NVS
+  写入降为 1 次），也避免两次提交之间掉电留下「count 已变、cur 还是旧值」的半套状态。
+- **切图顺序（R1.3.2）**：按键轮播**先刷屏、成功后才写 `cur`**。刷屏失败（空槽 / 坏槽 /
+  几何不符 / 互斥量超时）保留原 `cur`，避免下次按键「跳过一张」。
 - **槽内魔数 `0xA5 0x5A`**（与帧头魔数同值）：读槽、列缩略前一律先校验魔数 +
   载荷长度自洽，不符即视为空槽（新分区上电为 `0xFF`）。
 - `web` / `store` 分区尺寸一律运行时读取（`ota_web.c` / `store.c`），禁止硬编码。

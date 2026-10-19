@@ -33,6 +33,10 @@ bool power_should_sleep(void);
 /* 设唤醒源并进入深睡（不返回）。 */
 void power_enter_deep_sleep(void);
 
+/* R1.3.3：超时动作 = 关机 —— 释放自锁脚（GPIO2 拉低）让 MOS 断电，正常不返回。
+   无自锁电路时拉低无效，1 s 后退回深睡，避免设备空转。 */
+void power_self_lock_off(void);
+
 /* 电池电压 mV 粗测（分压 1M:1M，×2.0；满量程需按板实测标定）。 */
 int power_battery_mv(void);
 
