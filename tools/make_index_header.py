@@ -55,7 +55,7 @@ def main():
     lines.append("static const unsigned int index_html_len = %d;" % n)
     lines.append("")
 
-    open(DST, "w", encoding="ascii").write("\n".join(lines))
+    open(DST, "w", encoding="ascii", newline="\n").write("\n".join(lines))
     print("wrote %s (%d bytes, ver %s) -> %s" % (SRC, n, hdr_ver, DST))
     return 0
 

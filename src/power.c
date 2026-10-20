@@ -22,9 +22,12 @@ static const char *TAG = "power";
 #define BAT_DIV_DEN        100
 #define BAT_ADC_MAX        4095
 #define BAT_FULLSCALE_MV   3100   /* 12dB 满量程，按板实测标定（换分压后建议复核） */
-/* 未连接判定：单节锂电物理范围 + 连续有效次数（见 power_battery_mv）。 */
+/* 未连接判定：单节锂电物理范围 + 采样极差（见 power_battery_mv）。
+   R1.3.4：改为「一次调用内多次采样」，见函数注释。 */
 #define BAT_MV_MIN         2400
 #define BAT_MV_MAX         4600
+#define BAT_SAMPLES        12     /* 每次调用的采样点数（中位数抗单个坏点） */
+#define BAT_SPREAD_MAX     500    /* mV：max-min 超过即判悬空（真实电池毫秒级不会跳这么多） */
 
 static adc_oneshot_unit_handle_t s_adc;
 static TickType_t s_last_activity;
@@ -144,17 +147,38 @@ void power_self_lock_off(void)
 
 int power_battery_mv(void)
 {
-    /* 电池未连接检测：ADC 引脚悬空时读数靠杂散耦合乱漂（实测 3.2/3.3/17.6V 交替，
-       17.6V 即漂到接近满量程的换算值）。单次采样无法区分，用跨请求状态机：
-       读数必须落在单节锂电物理范围内，且连续 3 次 /api/info 轮询都有效才显示；
-       任一次超范围立即清零 → 页面显示「未连接」。真电池接上后轮询 2~3 次即出电压。 */
-    static int s_valid = 0;
+    /* R1.3.4（FB-019）：**一次调用内完成全部采样**。
+       旧实现要求「跨请求连续 3 次有效」才返回数值，而 /api/info 每次只调本函数一次、
+       控制页又只在打开时请求一次 ⇒ 计数器永远到不了 3，首次打开必显示「未连接」，
+       必须手动刷新数次才偶发出值（实测复现）。
+       新做法：
+       1. 连采 BAT_SAMPLES 次，取**中位数**（单个坏点不影响结果）；
+       2. 用**极差 max-min** 判悬空：ADC 悬空时读数靠杂散耦合乱漂
+          （实测 3.2/3.3/17.6V 交替），极差远大于真实电池；
+       3. 中位数越界或极差超限 → 返回 -1（页面显示「未连接」）。
+       这样单次 /api/info 即可出稳定电压，页面无需轮询
+       （轮询会让 power_activity() 不断续命、永不休眠）。 */
+    int v[BAT_SAMPLES];
+    int n = 0;
 
-    int raw = 0;
-    if (adc_oneshot_read(s_adc, s_adc_ch, &raw) != ESP_OK) { s_valid = 0; return -1; }
-    int mv = raw * BAT_FULLSCALE_MV / BAT_ADC_MAX * BAT_DIV_NUM / BAT_DIV_DEN;
+    for (int i = 0; i < BAT_SAMPLES; i++) {
+        int raw = 0;
+        if (adc_oneshot_read(s_adc, s_adc_ch, &raw) != ESP_OK) continue;
+        /* 注意乘法顺序：先除再乘，避免 raw*3100*200 溢出 int */
+        v[n++] = raw * BAT_FULLSCALE_MV / BAT_ADC_MAX * BAT_DIV_NUM / BAT_DIV_DEN;
+    }
+    if (n < 3) return -1;
 
-    if (mv < BAT_MV_MIN || mv > BAT_MV_MAX) { s_valid = 0; return -1; }
-    if (++s_valid < 3) return -1;
-    return mv;
+    /* 插入排序（最多 12 个元素），取中位数与极差 */
+    for (int i = 1; i < n; i++) {
+        int t = v[i], j = i - 1;
+        while (j >= 0 && v[j] > t) { v[j + 1] = v[j]; j--; }
+        v[j + 1] = t;
+    }
+    int med = v[n / 2];
+    int spread = v[n - 1] - v[0];
+
+    if (med < BAT_MV_MIN || med > BAT_MV_MAX) return -1;
+    if (spread > BAT_SPREAD_MAX) return -1;
+    return med;
 }

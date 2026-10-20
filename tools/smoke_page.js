@@ -445,5 +445,31 @@ ok("R1.3.0 CONTRACT 已同步轮播契约",
    && contract.indexOf("store_count") >= 0
    && contract.indexOf("version = " + VER) >= 0);
 
+ok("R1.3.4 固件：删除改为 NVS alive 位图（O(1)，搬移循环已删除）",
+   storeC.indexOf("#define KEY_ALIVE") >= 0
+   && storeC.indexOf("static int st_idx2phys(int idx)") >= 0
+   && storeC.indexOf("int store_slot_phys(int idx)") >= 0
+   && storeC.indexOf("int nc = st_popcount8(nav);") >= 0
+   && storeC.indexOf("for (int j = slot + 1;") < 0);
+ok("R1.3.4 固件：读取路径全部经逻辑→物理换算（不再直算偏移）",
+   (storeC.match(/int phys = st_idx2phys\(slot\);/g) || []).length === 4
+   && mainC.indexOf("int phys = store_slot_phys(i);") >= 0
+   && mainC.indexOf("int phys = store_slot_phys(slot);") >= 0
+   && mainC.indexOf("(uint32_t)i * STORE_SLOT_SZ") < 0);
+ok("R1.3.4 固件：老设备 alive 位图自动迁移 + count 以位图为准",
+   storeC.indexOf("alive bitmap created from count=") >= 0
+   && storeC.indexOf("((1u << c) - 1u) & mask") >= 0
+   && storeC.indexOf("int c = st_popcount8(s_alive);") >= 0);
+ok("R1.3.4 契约：§9 槽位映射（alive 位图 / 逻辑序号 / 零擦写）已记录",
+   contract.indexOf("槽位映射（R1.3.4）") >= 0
+   && contract.indexOf("store_slot_phys") >= 0
+   && contract.indexOf("flash 零擦写") >= 0);
+ok("R1.3.4 契约：§6.2 保留位（删除状态码 404/503/500 + bat_mv 语义）已记录",
+   contract.indexOf("### 6.2 状态码与 `bat_mv` 语义") >= 0
+   && contract.indexOf("#### 6.2.1") >= 0
+   && contract.indexOf("#### 6.2.2") >= 0
+   && contract.indexOf("no such slot") >= 0
+   && contract.indexOf("busy") >= 0);
+
 console.log(failed === 0 ? "SMOKE: ALL PASS" : ("SMOKE: " + failed + " FAILED"));
 process.exit(failed === 0 ? 0 : 1);

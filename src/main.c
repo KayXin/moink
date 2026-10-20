@@ -450,7 +450,10 @@ static esp_err_t carousel_list_handler(httpd_req_t *req)
         /* 路径 A：预存缩略（R1.3.2/3）。直接读缩略头拿 fmt/tlen，
            按实际大小 malloc，避免按 20KB 上限一次性分配 */
         const esp_partition_t *sp = store_part();
-        uint32_t off = (uint32_t)i * STORE_SLOT_SZ;
+        /* R1.3.4：i 是逻辑序号，物理槽允许留空洞（删除不再搬移），
+           必须换算后再算偏移，否则图库缩略图会整体错位。 */
+        int phys = store_slot_phys(i);
+        uint32_t off = (uint32_t)(phys < 0 ? i : phys) * STORE_SLOT_SZ;
         uint8_t fhdr[16], thdr[16];
         int has_pre = 0;
         uint32_t flen = 0;
@@ -523,7 +526,9 @@ static esp_err_t carousel_list_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
-/* POST /api/carousel/delete?slot=N：删除并紧凑前移。 */
+/* POST /api/carousel/delete?slot=N：删除并紧凑前移。
+   R1.3.4（FB-020）：错误不再一律 400——越界 404 / 忙 503 / 搬移失败 500，
+   控制页据此给出可读原因；串口日志带 slot 与 count 便于定位。 */
 static esp_err_t carousel_delete_handler(httpd_req_t *req)
 {
     power_activity();
@@ -531,11 +536,34 @@ static esp_err_t carousel_delete_handler(httpd_req_t *req)
     if (httpd_req_get_url_query_len(req) <= 0 ||
         httpd_req_get_url_query_len(req) >= (int)sizeof(qbuf) ||
         httpd_req_get_url_query_str(req, qbuf, sizeof(qbuf)) != ESP_OK ||
-        !kv_get(qbuf, "slot", vs, sizeof(vs)))
+        !kv_get(qbuf, "slot", vs, sizeof(vs))) {
+        ESP_LOGW(TAG, "delete: 缺少 slot 参数");
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad query");
+    }
     int slot = atoi(vs);
-    if (store_delete_slot(slot) != 0)
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad slot");
+
+    int count = 0, cur = 0;
+    store_meta_get(&count, &cur);
+    if (slot < 0 || slot >= count) {
+        ESP_LOGW(TAG, "delete: slot %d 越界（count=%d，前端索引可能已过期）",
+                 slot, count);
+        return httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "no such slot");
+    }
+
+    int r = store_delete_slot(slot);
+    if (r != STORE_DEL_OK) {
+        ESP_LOGE(TAG, "delete: slot %d 失败 err=%d（count=%d）", slot, r, count);
+        if (r == STORE_DEL_EBUSY) {
+            httpd_resp_set_status(req, "503 Service Unavailable");
+            httpd_resp_set_type(req, "text/plain");
+            return httpd_resp_sendstr(req, "busy");
+        }
+        if (r == STORE_DEL_EIO)
+            return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                       "move failed");
+        return httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "no such slot");
+    }
+
     httpd_resp_set_type(req, "text/plain");
     return httpd_resp_sendstr(req, "OK");
 }
@@ -553,13 +581,15 @@ static esp_err_t carousel_full_handler(httpd_req_t *req)
         !kv_get(qbuf, "slot", vs, sizeof(vs)))
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad query");
     int slot = atoi(vs);
-    if (slot < 0 || slot >= STORE_SLOT_MAX)
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad slot");
+    /* R1.3.4：slot 是逻辑序号；越界（含已删除的空洞）统一 404。 */
+    int phys = store_slot_phys(slot);
+    if (phys < 0)
+        return httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "no such slot");
 
     const esp_partition_t *sp = store_part();
     if (!sp)
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "store off");
-    uint32_t off = (uint32_t)slot * STORE_SLOT_SZ;
+    uint32_t off = (uint32_t)phys * STORE_SLOT_SZ;
 
     uint8_t hdr[16];
     if (esp_partition_read(sp, off, hdr, sizeof(hdr)) != ESP_OK ||

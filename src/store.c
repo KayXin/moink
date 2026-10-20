@@ -12,9 +12,20 @@
  * R1.3.1（交互定案）：语义改为「追加到末尾」——
  *   - 新图永远写到 count 槽，轮播满 8 张时拒绝上传（STORE_ERR_FULL），不再轮转覆盖；
  *   - store_delete_slot() 删除后把后续槽整体前移一位（顺序紧凑），新图继续追加；
+ *     ⚠️ 该行为自 R1.3.4 起取消，见下一节。
  *   - store_thumb_frame() 输出 96x69 的 8x8 抽稀缩略小帧，供网页缩略图列表渲染。
  *   读取：读槽 -> 校验魔数（0xA5 0x5A）-> 按头里的载荷长读回 -> 交 frame.c 显示。
  *   清空：只清 NVS 元数据，不擦 flash（下次写入整槽覆盖，省一次全分区擦写）。
+ *
+ * R1.3.4（FB-020 根治）：取消「删除后前移」——
+ *   - 新增 NVS 位图 alive（1 字节，bit i = 物理槽 i 有效）。逻辑序号 = alive 中
+ *     第 N 个置位的物理槽，因此物理槽允许留空洞，删除不再搬移任何数据。
+ *   - 删除 = 清一个 bit + count--/cur 修正，一次 NVS commit（原子），flash 零擦写。
+ *     原来删最前一张要搬 7 个槽（≈10 s、896 KB 擦写），现在 <20 ms。
+ *   - 上传优先写「末尾之后」的空位（等价于追加到末尾），末尾已满才回填最早的空洞。
+ *   - 老固件只有 cnt、没有 alive 键：init 时按 (1<<cnt)-1 生成，与旧物理布局等价；
+ *     alive 与 cnt 不一致时以 alive 为准修正 cnt（自愈）。
+ *   - 对外语义不变：接口的 slot 一律是逻辑序号（0..count-1），api 仍为 2。
  */
 #include "store.h"
 
@@ -32,11 +43,13 @@ static const char *TAG = "store";
 #define NVS_NS      "store"
 #define KEY_COUNT   "cnt"
 #define KEY_CUR     "cur"
-#define KEY_WIDX    "widx"
+#define KEY_WIDX    "widx"      /* R1.3.4 起不再维护（写指针恒等于 count） */
+#define KEY_ALIVE   "alive"     /* R1.3.4：物理槽有效位图，bit i = 槽 i 有效 */
 
 /* 帧头魔数（与 frame.h 的 FRAME_MAGIC0/1 一致，此处按值校验避免头文件耦合）。 */
 /* 槽内帧头魔数见 store.h（STORE_MAGIC0/1）。 */static const esp_partition_t *s_part;
 static uint32_t s_slots;
+static uint8_t  s_alive;        /* R1.3.4：物理槽有效位图（RAM 缓存，写时同步） */
 static SemaphoreHandle_t s_lock;
 
 /* ---------------- NVS 小工具 ---------------- */
@@ -80,6 +93,68 @@ static int st_nvs_set_u8s(const char *k1, uint8_t v1,
     return (e == ESP_OK) ? 0 : -1;
 }
 
+/* 与 st_nvs_get_u8 相同，但额外报告「键是否存在」——store_init 用它区分
+   「从没有 alive 键（老固件升级）」和「alive 恰为 0（用户清空过）」。 */
+static int st_nvs_get_u8f(const char *k, uint8_t *v, int *found)
+{
+    nvs_handle_t h;
+    *v = 0;
+    if (found) *found = 0;
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) return -1;
+    esp_err_t e = nvs_get_u8(h, k, v);
+    nvs_close(h);
+    if (found && e == ESP_OK) *found = 1;
+    if (e == ESP_ERR_NVS_NOT_FOUND) { *v = 0; return 0; }
+    return (e == ESP_OK) ? 0 : -1;
+}
+
+static int st_popcount8(uint8_t v)
+{
+    int n = 0;
+    while (v) { n += (v & 1); v >>= 1; }
+    return n;
+}
+
+/* 逻辑序号（0..count-1，按物理槽升序）-> 物理槽号。
+   越界 / 该序号没有对应的有效槽返回 -1。 */
+static int st_idx2phys(int idx)
+{
+    if (idx < 0) return -1;
+    for (int i = 0; i < (int)s_slots; i++) {
+        if (!(s_alive & (1u << i))) continue;
+        if (idx == 0) return i;
+        idx--;
+    }
+    return -1;
+}
+
+/* 新图写入位置：优先「最后一个有效槽之后」的空位（等价于追加到末尾），
+   末尾已满时才回填最早的空洞。只有回填时新图才不在逻辑末尾，所以
+   store_save_frame 必须用 st_phys2idx() 反查真实序号，不能假定 count-1。 */
+static int st_find_free(void)
+{
+    int last = -1;
+    for (int i = 0; i < (int)s_slots; i++)
+        if (s_alive & (1u << i)) last = i;
+    for (int i = last + 1; i < (int)s_slots; i++)
+        if (!(s_alive & (1u << i))) return i;
+    for (int i = 0; i <= last; i++)
+        if (!(s_alive & (1u << i))) return i;
+    return -1;
+}
+
+/* 物理槽 -> 逻辑序号（按 alive 升序数第几个）。phys 未被置位返回 -1。 */
+static int st_phys2idx(uint8_t alive, int phys)
+{
+    if (phys < 0 || !(alive & (1u << phys))) return -1;
+    return st_popcount8((uint8_t)(alive & ((1u << phys) - 1u)));
+}
+
+int store_slot_phys(int idx)
+{
+    return st_idx2phys(idx);
+}
+
 /* ---------------- 初始化 ---------------- */
 
 void store_init(void)
@@ -97,18 +172,38 @@ void store_init(void)
     if (s_slots > STORE_SLOT_MAX) s_slots = STORE_SLOT_MAX;
     s_lock = xSemaphoreCreateMutex();
 
-    /* 元数据归一：越界值回落，避免历史脏数据把轮播指针带飞。 */
-    uint8_t c = 0, w = 0;
+    /* 元数据归一 + 槽位位图（R1.3.4）。alive 的 bit i = 物理槽 i 有效；
+       逻辑序号 = alive 中第 N 个置位的槽（物理槽因此可以留空洞）。
+       老固件只有 cnt 没有 alive 键：按「物理连续」生成 (1<<cnt)-1，与旧布局
+       完全等价，升级零风险；两者不一致时以 alive 为准（它直接决定可读槽）。 */
+    uint8_t c = 0, w = 0, av = 0;
+    int found = 0;
     st_nvs_get_u8(KEY_COUNT, &c);
     st_nvs_get_u8(KEY_WIDX, &w);
+    st_nvs_get_u8f(KEY_ALIVE, &av, &found);
     if (c > STORE_SLOT_MAX) { c = 0; st_nvs_set_u8(KEY_COUNT, c); }
     if (w >= STORE_SLOT_MAX) { w = 0; st_nvs_set_u8(KEY_WIDX, w); }
 
+    uint8_t mask = (uint8_t)((s_slots >= 8) ? 0xFFu : ((1u << s_slots) - 1u));
+    if (!found) {
+        av = (uint8_t)(((1u << c) - 1u) & mask);
+        st_nvs_set_u8(KEY_ALIVE, av);
+        ESP_LOGI(TAG, "alive bitmap created from count=%u -> 0x%02X", c, av);
+    }
+    av &= mask;
+    int pc = st_popcount8(av);
+    if (pc != (int)c) {
+        ESP_LOGW(TAG, "meta mismatch: count=%u alive=0x%02X -> fix count=%d",
+                 c, av, pc);
+        st_nvs_set_u8(KEY_COUNT, (uint8_t)pc);
+    }
+    s_alive = av;
+
     ESP_LOGI(TAG, "store: off=0x%06lx size=%lu KB, %lu slot(s) x %u KB, "
-                  "count=%u widx=%u",
+                  "count=%d alive=0x%02X widx=%u",
              (unsigned long)s_part->address, (unsigned long)(s_part->size / 1024),
              (unsigned long)s_slots, (unsigned)(STORE_SLOT_SZ / 1024),
-             c, w);
+             pc, (unsigned)av, w);
 }
 
 int store_slots(void)
@@ -125,19 +220,25 @@ const esp_partition_t *store_part(void)
 
 void store_meta_get(int *count, int *cur)
 {
-    uint8_t c = 0, k = 0;
-    st_nvs_get_u8(KEY_COUNT, &c);
+    uint8_t k = 0;
     st_nvs_get_u8(KEY_CUR, &k);
-    if (c > STORE_SLOT_MAX) c = 0;
+    /* R1.3.4：张数以 alive 位图为唯一真源，避免 cnt 与位图不一致时
+       carousel_next() 的取模把 cur 带到不存在的槽。 */
+    int c = st_popcount8(s_alive);
     if (k >= c) k = 0;
-    if (count) *count = (int)c;
+    if (count) *count = c;
     if (cur)   *cur = (int)k;
 }
 
 void store_meta_set(int count, int cur)
 {
+    /* R1.3.4：该接口现在只用于轮播推进（改 cur）。count 以 alive 位图为准，
+       调用方传入的过期值不参与写入，避免把 NVS 的 cnt 写坏。 */
+    int c = st_popcount8(s_alive);
+    if (count != c) count = c;
     if (count < 0 || count > STORE_SLOT_MAX) return;
-    if (cur < 0 || cur >= count) cur = 0;
+    if (count == 0) cur = 0;
+    else if (cur < 0 || cur >= count) cur = 0;
     st_nvs_set_u8s(KEY_COUNT, (uint8_t)count, KEY_CUR, (uint8_t)cur, NULL, 0);
 }
 
@@ -156,8 +257,9 @@ static uint16_t st_crc16(const uint8_t *d, size_t n)
     return crc;
 }
 
-/* 保存一帧：新图追加到末尾槽（= 当前 count）。轮播满 8 时拒绝（STORE_ERR_FULL），
-   不再轮转覆盖。成功后 count++、cur 指向新图，全部落 NVS。 */
+/* 保存一帧：逻辑上追加到末尾（cur 指向新图），物理上优先写末尾之后的空位，
+   末尾已满才回填最早的空洞（R1.3.4）。轮播满时拒绝（STORE_ERR_FULL），
+   不覆盖已有图。count / cur / alive 一次 NVS commit。 */
 int store_save_frame(const uint8_t *hdr, uint32_t hdr_len,
                      const uint8_t *payload, uint32_t len,
                      const uint8_t *thumb, uint32_t tlen)
@@ -171,15 +273,19 @@ int store_save_frame(const uint8_t *hdr, uint32_t hdr_len,
 
     if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(5000)) != pdTRUE) return -1;
 
-    uint8_t cnt = 0;
-    st_nvs_get_u8(KEY_COUNT, &cnt);
-    if (cnt > STORE_SLOT_MAX) cnt = 0;
-    if (cnt >= STORE_SLOT_MAX) {
+    int cnt = st_popcount8(s_alive);
+    if (cnt >= (int)s_slots) {
         xSemaphoreGive(s_lock);
         return STORE_ERR_FULL;      /* 已满：请先删除或清空 */
     }
 
-    int slot = (int)cnt;            /* 追加到末尾 */
+    /* 逻辑上始终「追加到末尾」，物理上写到第一个空位——删除留下的空洞被
+       原地复用，省掉整槽搬移（R1.3.4）。 */
+    int slot = st_find_free();
+    if (slot < 0) {
+        xSemaphoreGive(s_lock);
+        return STORE_ERR_FULL;
+    }
     uint32_t off = (uint32_t)slot * STORE_SLOT_SZ;
 
     esp_err_t e = esp_partition_erase_range(s_part, off, STORE_SLOT_SZ);
@@ -195,84 +301,74 @@ int store_save_frame(const uint8_t *hdr, uint32_t hdr_len,
         return -1;
     }
 
-    st_nvs_set_u8s(KEY_COUNT, (uint8_t)(cnt + 1), KEY_CUR, (uint8_t)slot, NULL, 0);
-
-    xSemaphoreGive(s_lock);
-    ESP_LOGI(TAG, "saved frame -> slot %d (count=%u)", slot, cnt + 1);
-    return slot;
-}
-
-/* 删除槽 slot 并紧凑：slot+1..count-1 依次前移一位，count--。
-   cur 修正：被删槽在前则 cur--；正好删当前图则 cur 指向前移后的同位置；
-   写指针不再单独维护（新图始终追加到 count 槽）。 */
-int store_delete_slot(int slot)
-{
-    if (!s_part || !s_lock) return -1;
-
-    uint8_t cnt = 0, cur = 0;
-    st_nvs_get_u8(KEY_COUNT, &cnt);
-    st_nvs_get_u8(KEY_CUR, &cur);
-    if (cnt > STORE_SLOT_MAX) cnt = 0;
-    if ((int)cnt <= 0 || slot < 0 || slot >= (int)cnt) return -1;
-
-    if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(5000)) != pdTRUE) return -1;
-
-    uint8_t *buf = malloc(4096);
-    if (!buf) {
-        xSemaphoreGive(s_lock);
+    /* 一次 commit 写 count / cur / alive：掉电最多是「槽已写、位图未置」，
+       此时该槽仍被当成空槽，下次上传覆盖它，不会污染逻辑序号。 */
+    uint8_t nav = (uint8_t)(s_alive | (1u << slot));
+    int ncnt = cnt + 1;
+    int ncur = st_phys2idx(nav, slot);      /* 回填空洞时新图不在末尾 */
+    if (ncur < 0) ncur = ncnt - 1;
+    if (st_nvs_set_u8s(KEY_COUNT, (uint8_t)ncnt, KEY_CUR, (uint8_t)ncur,
+                       KEY_ALIVE, nav) != 0) {
+        xSemaphoreGive(s_lock);         /* 位图不置位：该槽保持「空」 */
         return -1;
     }
-
-    int err = 0;
-    for (int j = slot + 1; j < (int)cnt; j++) {
-        uint32_t src = (uint32_t)j * STORE_SLOT_SZ;
-        uint32_t dst = (uint32_t)(j - 1) * STORE_SLOT_SZ;
-        /* 流式块复制：读帧头拿真实长度，探测缩略区（R1.3.2），按 4KB 块
-           整体搬「帧头+帧载荷[+缩略头+缩略载荷]」，不整帧 malloc */
-        uint8_t hdr[16];
-        if (esp_partition_read(s_part, src, hdr, sizeof(hdr)) != ESP_OK ||
-            hdr[0] != STORE_MAGIC0 || hdr[1] != STORE_MAGIC1) { err = -1; break; }
-        uint32_t len = ((uint32_t)hdr[8] << 24) | ((uint32_t)hdr[9] << 16) |
-                       ((uint32_t)hdr[10] << 8) | hdr[11];
-        if (len == 0 || len > STORE_FRAME_MAX) { err = -1; break; }
-        uint32_t tlen = 0;
-        uint8_t thdr[16];
-        if (esp_partition_read(s_part, src + 16 + len, thdr, sizeof(thdr)) == ESP_OK &&
-            thdr[0] == STORE_MAGIC0 && thdr[1] == STORE_MAGIC1) {
-            uint32_t tl = ((uint32_t)thdr[8] << 24) | ((uint32_t)thdr[9] << 16) |
-                          ((uint32_t)thdr[10] << 8) | thdr[11];
-            uint32_t lim = (thdr[2] == 2) ? STORE_THUMB_JPEG_MAX
-                                           : STORE_THUMB_LEN;
-            if (tl && tl <= lim) tlen = tl;
-        }
-        uint32_t total = 16u + len + (tlen ? 16u + tlen : 0u);
-        if (esp_partition_erase_range(s_part, dst, STORE_SLOT_SZ) != ESP_OK) { err = -1; break; }
-        uint32_t off = 0;
-        while (off < total) {
-            uint32_t k = (total - off > 4096) ? 4096 : total - off;
-            if (esp_partition_read(s_part, src + off, buf, k) != ESP_OK ||
-                esp_partition_write(s_part, dst + off, buf, k) != ESP_OK) { err = -1; break; }
-            off += k;
-        }
-        if (err) break;
-    }
-    free(buf);
-
-    if (err == 0) {
-        uint8_t nc = (uint8_t)(cnt - 1);
-        uint8_t ncur = cur;
-        if (slot < (int)cur) ncur = (uint8_t)(cur - 1);
-        else if (slot == (int)cur)
-            ncur = (nc == 0) ? 0 : (uint8_t)((cur >= nc) ? nc - 1 : cur);
-        st_nvs_set_u8s(KEY_COUNT, nc, KEY_CUR, ncur, NULL, 0);
-        ESP_LOGI(TAG, "deleted slot %d -> count=%u cur=%u", slot, nc, ncur);
-    }
+    s_alive = nav;
 
     xSemaphoreGive(s_lock);
-    return err;
+    ESP_LOGI(TAG, "saved frame -> phys slot %d, logical %d (count=%d, alive=0x%02X)",
+             slot, ncur, ncnt, (unsigned)nav);
+    return ncur;            /* 返回逻辑序号，供调用方日志/显示 */
 }
 
-/* 生成槽 slot 的缩略小帧：4x4 抽稀取众数色，位序与整帧（packIdx）同一契约：
+/* 删除逻辑序号 slot：只清 alive 里的一个 bit，不碰 flash、不搬移（R1.3.4）。
+   物理槽内容原样留着当空洞，下次上传原地复用（写入前本来就要整槽擦）。
+   cur 修正：被删槽在前则 cur--；正好删当前图则 cur 指向前移后的同位置。
+   返回 STORE_DEL_*。 */
+int store_delete_slot(int slot)
+{
+    if (!s_part || !s_lock) {
+        ESP_LOGE(TAG, "delete: store 未初始化（分区或锁缺失）");
+        return STORE_DEL_EBAD;
+    }
+    if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(5000)) != pdTRUE) {
+        ESP_LOGW(TAG, "delete: 取锁超时（slot %d）", slot);
+        return STORE_DEL_EBUSY;
+    }
+
+    int phys = st_idx2phys(slot);
+    if (phys < 0) {
+        ESP_LOGW(TAG, "delete: 逻辑槽 %d 不存在（alive=0x%02X）",
+                 slot, (unsigned)s_alive);
+        xSemaphoreGive(s_lock);
+        return STORE_DEL_EBAD;
+    }
+
+    uint8_t cur = 0;
+    st_nvs_get_u8(KEY_CUR, &cur);
+
+    uint8_t nav = (uint8_t)(s_alive & ~(1u << phys));
+    int nc = st_popcount8(nav);
+    int ncur = (int)cur;
+    if (slot < (int)cur) ncur = (int)cur - 1;
+    else if (slot == (int)cur)
+        ncur = (nc == 0) ? 0 : ((cur >= nc) ? (nc - 1) : (int)cur);
+    if (ncur < 0 || ncur >= nc) ncur = 0;
+
+    if (st_nvs_set_u8s(KEY_COUNT, (uint8_t)nc, KEY_CUR, (uint8_t)ncur,
+                       KEY_ALIVE, nav) != 0) {
+        ESP_LOGE(TAG, "delete: 元数据提交失败（逻辑 %d / 物理 %d）", slot, phys);
+        xSemaphoreGive(s_lock);
+        return STORE_DEL_EIO;
+    }
+    s_alive = nav;
+
+    xSemaphoreGive(s_lock);
+    ESP_LOGI(TAG, "deleted logical %d (phys %d) -> count=%d cur=%d alive=0x%02X",
+             slot, phys, nc, ncur, (unsigned)nav);
+    return STORE_DEL_OK;
+}
+
+/* 生成逻辑槽 slot 的缩略小帧：4x4 抽稀取众数色，位序与整帧（packIdx）同一契约：
    行自下而上、列右到左、字节内 MSB 优先。输出 16B 帧头 + 抽稀载荷，
    头内写实际几何（768x552→192x138，800x600→200x150）。
    内存友好：不整帧 malloc，按「缩略行」读 4 个源行缓冲（最大 4*200B），
@@ -283,7 +379,12 @@ int store_thumb_frame(int slot, uint8_t *out, uint32_t cap)
     if (cap < STORE_THUMB_ENTRY) return -1;
     if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(5000)) != pdTRUE) return -1;
 
-    uint32_t off = (uint32_t)slot * STORE_SLOT_SZ;
+    int phys = st_idx2phys(slot);          /* 逻辑序号 -> 物理槽（R1.3.4） */
+    if (phys < 0) {
+        xSemaphoreGive(s_lock);
+        return -1;
+    }
+    uint32_t off = (uint32_t)phys * STORE_SLOT_SZ;
     uint8_t hdr[16];
     if (esp_partition_read(s_part, off, hdr, sizeof(hdr)) != ESP_OK) {
         ESP_LOGE(TAG, "thumb: slot %d header read failed", slot);
@@ -398,12 +499,17 @@ int store_thumb_frame(int slot, uint8_t *out, uint32_t cap)
 int store_load_slot(int slot, uint8_t *buf, uint32_t cap)
 {
     if (!s_part || !s_lock) return -1;
-    if (slot < 0 || slot >= (int)s_slots) return -1;
+    if (slot < 0) return -1;
     if (cap < 16) return -1;
 
     if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(5000)) != pdTRUE) return -1;
 
-    uint32_t off = (uint32_t)slot * STORE_SLOT_SZ;
+    int phys = st_idx2phys(slot);          /* 逻辑序号 -> 物理槽（R1.3.4） */
+    if (phys < 0) {
+        xSemaphoreGive(s_lock);
+        return -1;
+    }
+    uint32_t off = (uint32_t)phys * STORE_SLOT_SZ;
     uint8_t hdr[16];
     esp_err_t e = esp_partition_read(s_part, off, hdr, sizeof(hdr));
     int total = -1;
@@ -432,12 +538,17 @@ int store_load_slot(int slot, uint8_t *buf, uint32_t cap)
 int store_load_thumb(int slot, uint8_t *out, uint32_t cap)
 {
     if (!s_part || !s_lock) return -1;
-    if (slot < 0 || slot >= (int)s_slots) return -1;
+    if (slot < 0) return -1;
     if (cap < STORE_THUMB_ENTRY_MAX) return -1;
 
     if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(5000)) != pdTRUE) return -1;
 
-    uint32_t off = (uint32_t)slot * STORE_SLOT_SZ;
+    int phys = st_idx2phys(slot);          /* 逻辑序号 -> 物理槽（R1.3.4） */
+    if (phys < 0) {
+        xSemaphoreGive(s_lock);
+        return -1;
+    }
+    uint32_t off = (uint32_t)phys * STORE_SLOT_SZ;
     uint8_t fhdr[16], thdr[16];
     int total = -1;
     if (esp_partition_read(s_part, off, fhdr, sizeof(fhdr)) == ESP_OK &&
@@ -468,6 +579,10 @@ int store_load_thumb(int slot, uint8_t *out, uint32_t cap)
 
 void store_clear(void)
 {
-    st_nvs_set_u8s(KEY_COUNT, 0, KEY_CUR, 0, KEY_WIDX, 0);
-    ESP_LOGI(TAG, "carousel cleared (metadata only, slots left for rotation)");
+    if (st_nvs_set_u8s(KEY_COUNT, 0, KEY_CUR, 0, KEY_ALIVE, 0) != 0) {
+        ESP_LOGE(TAG, "clear: 元数据写入失败");
+        return;
+    }
+    s_alive = 0;
+    ESP_LOGI(TAG, "carousel cleared (bitmap reset, slots left as-is)");
 }

@@ -2,7 +2,7 @@
 
 > 本文档是**固件与页面之间的唯一权威接口定义**，以及**屏驱动的物理契约**。
 > 改动任何一条必须同步更新 `check_frame.py` / `smoke_page.js` 并全量回归。
-> 版本：version = R1.3.3（固件与控制页共用这一个号），api = 2。
+> 版本：version = R1.3.4（固件与控制页共用这一个号），api = 2。
 
 ---
 
@@ -224,14 +224,14 @@ OTA 重启、恢复出厂重启、复位都归为 `power_on`。
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/` | 控制页（web 分区优先，否则内嵌页） |
-| GET | `/api/info` | 状态 JSON：**ver**/fw/api/panel/**gpio_preset**/heap/bat_mv/sleep_s/wake_s/clients/ssid/uptime/**store_slots**/**store_count**/**store_cur**/**wake_reason**/**wake_bits**（`ver` = 当前生效版本，`wake_reason` 见 §5.2） |
+| GET | `/api/info` | 状态 JSON：**ver**/fw/api/panel/**gpio_preset**/heap/bat_mv/sleep_s/wake_s/clients/ssid/uptime/**store_slots**/**store_count**/**store_cur**/**wake_reason**/**wake_bits**（`ver` = 当前生效版本，`wake_reason` 见 §5.2；`bat_mv` 语义见 §6.2.2） |
 | GET | `/api/settings` | 读设置 JSON：panel/hflip/wifi_pwr/**gpio_preset**/**pins[8]**/sleep_s/**timeout_action**/wake_s/**wake_show**/ssid/pass_set |
 | POST | `/api/settings` | 写设置（`panel`/`hflip`/`gpio_preset`（自定义档另带 `p_adc`/`p_wake`/`p_sck`/`p_mosi`/`p_cs`/`p_dc`/`p_rst`/`p_busy`）/`sleep_s`/**`timeout_action`**/`wake_s`/**`wake_show`**；热点凭据单字段更新见 §7） |
 | POST | `/api/frame` | 传图（§1 帧格式）。query：`save=1` 存轮播槽并显示、`save=1&noshow=1` 只存不显示、`tlen=N` 随帧携带缩略（§1.1）。无 `save` = 只显示不存 |
-| POST | `/api/carousel/clear` | 清空轮播：**只清 NVS 元数据、不擦 flash**（`count=0` / `cur=0`） |
+| POST | `/api/carousel/clear` | 清空轮播：**只清 NVS 元数据、不擦 flash**（`count=0` / `cur=0` / `alive=0`） |
 | GET | `/api/carousel/list` | 图库列表 JSON：`{slots,count,cur,items[{slot,fmt,w,h,len,data}]}`，`data` = 缩略图 base64（`fmt=2` 为彩色 JPEG，`fmt=1` 为 2bit 帧） |
 | GET | `/api/carousel/full?slot=N` | 整帧二进制（16B 头 + 2bpp 载荷），供网页大图预览；流式读 flash 分块发送 |
-| POST | `/api/carousel/delete?slot=N` | 删除该槽并**紧凑前移**（后续槽整体前进一位、`count--`、`cur` 修正） |
+| POST | `/api/carousel/delete?slot=N` | 删除**逻辑槽** N：只清 `alive` 位图对应位 + `count--` / `cur` 修正，**不搬移数据、flash 零擦写**（R1.3.4）。状态码见 §6.2 |
 | POST | **`/api/upload`** | **★ 统一升级入口（R1.2.0，FB-015）**：按请求体首块内容自动识别固件 / 控制页，见 §6.1 |
 | POST | `/api/web/clear` | 清空 web 分区（回到内嵌页） |
 | POST | `/api/clear` | 残影清理（可选 `cycles` 1–4） |
@@ -253,6 +253,32 @@ OTA 重启、恢复出厂重启、复位都归为 `power_on`。
 - 固件预读**首块 ≥ 64 字节**用于判定；预读字节必须**原样**参与后续写入（丢文件头整包报废）。
 - 固件升级的「同步更新控制页」在 R1.2.0 起是**默认行为**（原 `?sync_page=1` 的可选语义取消）。
 - R1.1.x 的 `POST /api/ota`（含 `?sync_page=1`）与 `POST /api/web` 已**整体删除**，不做向后兼容。
+
+### 6.2 状态码与 `bat_mv` 语义（R1.3.4 起）
+
+#### 6.2.1 `/api/carousel/delete` 失败语义
+
+| 状态码 | 含义 | 固件返回体 | 页面提示 |
+|---|---|---|---|
+| `200` | 删除成功 | `OK` | 「已删除」 |
+| `400` | 查询串缺失 / `slot` 非法 | `bad query` | 「请求参数异常」 |
+| `404` | 该逻辑序号当前不存在（`slot < 0` 或 `slot >= count`，多为前端索引已过期） | `no such slot` | 「这张图已不在」 |
+| `503` | 取 store 锁超时（上传 / 刷屏正在占用） | `busy` | 「设备正忙，请重试」 |
+| `500` | 元数据提交失败 / store 分区不可用 | `store io` / `store off` | 显示响应正文 |
+
+- R1.3.4 之前所有失败统一压成 `400 bad slot`，无法区分「索引过期」与「设备忙」，
+  这是 FB-020 里删除体验混乱的直接原因。
+- 前端约定：收到 `400` / `404` 一律**立即重拉 `/api/carousel/list`** 让索引回正；
+  `503` 可原样重试一次（R1.3.4 起删除是毫秒级，重试不会造成长阻塞）。
+
+#### 6.2.2 `/api/info` 的 `bat_mv`
+
+- 取值：`>0` = 实测电池电压（mV，已按分压比还原）；`-1` = 未接电池 / 引脚悬空 / ADC 失败。
+- 采样：**单次调用内连采 `BAT_SAMPLES`(12) 次取中位数**，并以极差 `max-min > 500 mV`
+  判悬空。所以**一次请求就能出值**，不再依赖「跨请求连续 N 次有效」的旧状态机
+  （旧实现下页面首次打开必然显示「未连接」）。
+- ⚠️ 调用 `/api/info` 会刷新 `power_activity()`：**页面不得为读电压而轮询**，
+  否则设备永远到不了超时休眠。页面只在打开、保存设置后各取一次。
 
 ## 7. 设置与 NVS
 
@@ -282,6 +308,7 @@ OTA 重启、恢复出厂重启、复位都归为 `power_on`。
   AP 通道 **6**（避开 ESP32-C3 40MHz 晶振落在 2.4 GHz 低段的谐波，见 FB-001），最多 4 客户端，
   DHCP DNS 指向 `192.168.4.1`。
 - **轮播元数据单独一个命名空间 `store`**（R1.3.0）：`cnt` = 有效张数、`cur` = 当前显示槽、
+  **`alive`** = 物理槽有效位图（R1.3.4；槽位状态的唯一真源，`cnt` 由 `popcount(alive)` 推导）、
   `widx` = 历史写指针（R1.3.1 起「追加到末尾」后不再使用，读到即归一为 `0`）。
   它与 `moink` 命名空间一起被「恢复出厂」的 `nvs_erase_all()` 清掉。
 - ⚠️ `store_count` / `store_cur` 是 NVS 值，**与 store 分区是否存在无关**：旧分区表（无 store）
@@ -331,17 +358,30 @@ OTA 重启、恢复出厂重启、复位都归为 `power_on`。
 - **store 槽位布局**（`src/store.c`）：8 个固定 **128 KiB** 槽位 + 64 KiB 预留。
   每槽存「16B 帧头 + 2bpp 载荷 [+ 16B 缩略头 + 缩略载荷]」；768×552 时帧部分 = 106,000 B，
   槽余量约 24.5 KB 供缩略使用（帧缓冲仍按旧上限 120,000 B 分配，留余量）。
-- **写入策略（R1.3.0 起启用；R1.3.1 起为「追加到末尾」）**：新图**永远写到槽 `count`**，
-  整槽擦写一次（写放大 = 1）；**满 8 张拒绝上传**（`507 carousel full`），
-  不再 round-robin 覆盖最早一张。删除槽 `N` 时 `N+1..count-1` 整体**前移一位**
-  （每移动一槽一次整槽擦写），`count--` 并修正 `cur`；`cur` 已删则落到前移后的同位置
-  （原末张被删则落到新末张）。`count` / `cur` 存 NVS 命名空间 `store`
-  （NVS 自带磨损均衡）；store 分区内不放会被反复改写的元数据。
+- **写入策略（R1.3.0 起启用；R1.3.1 起「追加到末尾」；R1.3.4 起删除不再搬移）**：
+  新图**逻辑上追加到末尾**（`cur` 指向它），**满 8 张拒绝上传**（`507 carousel full`），
+  不 round-robin 覆盖最早一张。物理上优先写「最后一个有效槽之后」的空位，末尾已满时
+  才回填最早的空洞（此时新图落在逻辑中间，`cur` 由 `st_phys2idx()` 反查）。
+  每次上传仍只整槽擦写一次（写放大 = 1）。
+- **★ 槽位映射（R1.3.4）**：NVS 位图 `alive`（1 B，bit i = 物理槽 i 有效）是槽位状态的
+  **唯一真源**；对外接口的 `slot` 一律是**逻辑序号**（`0..count-1`，按物理槽升序），
+  因此**物理槽允许留空洞**。删除 = 清一个 bit + `count--`/`cur` 修正，一次 `nvs_commit`，
+  **flash 零擦写、耗时 <20 ms**。R1.3.4 之前是 `N+1..count-1` 整体前移——删首张要搬 7 槽
+  （≈224 扇区擦除 + 742 KB 写入、约 10 s 持锁），既是删除偶发 400 / 误删的根因，
+  也让每次删除白擦 896 KB。`count` 由 `popcount(alive)` 推导，不再单独信任 NVS 的 `cnt`。
+  **调用方不得用 `idx * STORE_SLOT_SZ` 自算物理偏移**，必须走 `store_slot_phys(idx)`
+  （`/api/carousel/list` 与 `/full` 已按此改写）。
+- **升级兼容（R1.3.4）**：老固件只有 `cnt`、没有 `alive` 键 → 启动时按 `(1<<cnt)-1`
+  生成，与旧物理连续布局逐槽等价，无需迁移；两者不一致时以 `alive` 为准修正 `cnt`。
+- `cur` 落到被删位置的前一张（删的是当前图时）；`count` / `cur` / `alive` 存 NVS
+  命名空间 `store`（NVS 自带磨损均衡）；store 分区内不放会被反复改写的元数据。
   「清空轮播」**只清 NVS 元数据、不擦 flash**（槽内容留待下次写入整槽覆盖）。
   延寿调研详见 `docs/调研-内置Flash延寿方案.md`。
-- **元数据写入原子性（R1.3.2）**：`count` / `cur` / `widx` 的多键更新一律走
-  `st_nvs_set_u8s()` **一次 `nvs_commit`**，不再各键各提交一次（每次切图从 2 次 NVS
-  写入降为 1 次），也避免两次提交之间掉电留下「count 已变、cur 还是旧值」的半套状态。
+- **元数据写入原子性（R1.3.2 起，R1.3.4 扩到 `alive`）**：`count` / `cur` / `alive` 的
+  多键更新一律走 `st_nvs_set_u8s()` **一次 `nvs_commit`**，不再各键各提交一次
+  （每次切图从 2 次 NVS 写入降为 1 次），也避免两次提交之间掉电留下「count 已变、
+  cur 还是旧值」的半套状态。上传时顺序为「先写槽、后提交元数据」：掉电最多是
+  槽已写但位图未置，该槽仍被视为空槽，下次上传覆盖它。
 - **切图顺序（R1.3.2）**：按键轮播**先刷屏、成功后才写 `cur`**。刷屏失败（空槽 / 坏槽 /
   几何不符 / 互斥量超时）保留原 `cur`，避免下次按键「跳过一张」。
 - **槽内魔数 `0xA5 0x5A`**（与帧头魔数同值）：读槽、列缩略前一律先校验魔数 +
