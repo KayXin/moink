@@ -259,7 +259,7 @@ ok("R1.2.1 上传前显示 loading",
    page.indexOf('id="workLoading"') >= 0 && page.indexOf('id="workLoadingText"') >= 0
    && js.indexOf("function afterLoadingPaint(fn)") >= 0
    && js.indexOf('showWorkLoading("正在生成上传数据…")') >= 0
-   && js.indexOf("afterLoadingPaint(function(){ buildAndUpload(true); })") >= 0);
+   && js.indexOf('afterLoadingPaint(function(){ buildAndUpload("show"); })') >= 0);
 ok("R1.2.1 裁剪手势松手后才生成目标预览",
    js.indexOf("crop: function(){ schedulePreview(true); }") < 0
    && js.indexOf("cropend: function(){ cropInvalid(); schedulePreview(false); }") >= 0);
@@ -368,11 +368,14 @@ ok("R1.3.0 页面：图库卡片 + 大图预览层元素",
    page.indexOf('id="galGrid"') >= 0 && page.indexOf('id="carouselClear"') >= 0
    && page.indexOf('id="prevOverlay"') >= 0 && page.indexOf('id="prevCanvas"') >= 0
    && page.indexOf('id="prevClose"') >= 0 && page.indexOf('id="caromsg"') >= 0);
-ok("R1.3.0 页面：「仅上传」按钮 + 双语义上传（save=1 / noshow=1）",
-   page.indexOf('id="goOnly"') >= 0 && js.indexOf("function uploadOnly()") >= 0
-   && js.indexOf("function buildAndUpload(show)") >= 0
-   && js.indexOf('"/api/frame?save=1"') >= 0
-   && js.indexOf('"/api/frame?save=1&noshow=1"') >= 0);
+ok("R1.3.4 页面：双通道上传 —— 刷新不入库 / 入库不刷新（FB-018）",
+   page.indexOf('id="goOnly"') >= 0 && page.indexOf("上传到图库") >= 0
+   && js.indexOf("function uploadOnly()") >= 0
+   && js.indexOf("function buildAndUpload(mode)") >= 0
+   && js.indexOf('var doSave = (mode === "save")') >= 0
+   && js.indexOf('api(doSave ? "/api/frame?save=1&noshow=1" : "/api/frame")') >= 0
+   && js.indexOf('buildAndUpload("show")') >= 0
+   && js.indexOf('buildAndUpload("save")') >= 0);
 ok("R1.3.0 页面：轮播满 8 的 507 提示",
    js.indexOf("xhr.status === 507") >= 0 && js.indexOf("轮播已满 8 张") >= 0);
 ok("R1.3.2 固件侧：carousel_next 只在 display_task 中调用一次",

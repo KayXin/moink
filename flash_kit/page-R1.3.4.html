@@ -364,8 +364,8 @@ details summary{ cursor:pointer; font-weight:600; font-size:14px; color:var(--in
     <div id="prevWrap"><canvas id="prev" width="552" height="768"></canvas><div id="objLayer"></div></div>
     <div id="stathint"></div>
     <div class="row">
-      <button class="sec" id="goOnly" disabled style="background:#1e6fd9;color:#fff;border-color:#1e6fd9;flex:1;min-width:0">仅上传</button>
-      <button class="sec" id="go" disabled style="flex:1;min-width:0">上传并刷新屏幕</button>
+      <button class="sec" id="go" disabled style="background:#1e6fd9;color:#fff;border-color:#1e6fd9;flex:1;min-width:0">上传并刷新屏幕</button>
+      <button class="sec" id="goOnly" disabled style="flex:1;min-width:0">上传到图库</button>
     </div>
     <div id="bar"><div id="fill"></div></div>
     <p id="msg"></p>
@@ -375,7 +375,8 @@ details summary{ cursor:pointer; font-weight:600; font-size:14px; color:var(--in
   <!-- ================= 轮播图库（R1.3.1） ================= -->
   <section class="card" id="galleryCard">
     <h3>设备轮播图库<span class="tag">最多 8 张</span></h3>
-    <div class="hint">用上方「上传并刷新屏幕」添加轮播图，可先编辑再上传；满 8 张后需先删除或清空。
+    <div class="hint"><b>「上传并刷新屏幕」只换画面、不占图库</b>（临时换图，不磨 flash）；
+      <b>「上传到图库」</b>才占用一个槽位、可离线循环播放；满 8 张后需先删除或清空。
       点击缩略图看大图，点 × 删除该张。<b>双击设备按键</b>切到下一张（单击只唤醒、不切图；长按 20 秒恢复出厂）。</div>
     <div class="galGrid" id="galGrid"></div>
     <div class="row">
@@ -2078,9 +2079,10 @@ function upload(){
   goOnlyEl.disabled = true;
   msg("正在合成画面…", "");
   showWorkLoading("正在生成上传数据…");
-  afterLoadingPaint(function(){ buildAndUpload(true); });
+  afterLoadingPaint(function(){ buildAndUpload("show"); });
 }
-/* R1.3.1：仅上传 —— 存轮播但不刷新屏幕，缩短入库时频繁刷屏；图库仍会更新 */
+/* R1.3.4（FB-018）：上传到图库 —— 占一个轮播槽但不刷新屏幕，
+   批量入库不必逐张等刷屏；图库列表随即更新。 */
 function uploadOnly(){
   if (LOCAL_PREVIEW){
     msg("本地预览模式：请连接 MoInk 热点后打开 http://192.168.4.1 上传", "err");
@@ -2092,9 +2094,10 @@ function uploadOnly(){
   goOnlyEl.disabled = true;
   msg("正在合成画面…", "");
   showWorkLoading("正在生成上传数据…");
-  afterLoadingPaint(function(){ buildAndUpload(false); });
+  afterLoadingPaint(function(){ buildAndUpload("save"); });
 }
-function buildAndUpload(show){
+function buildAndUpload(mode){
+  var doSave = (mode === "save");
   var payload;
   try { payload = packFull(); }
   catch(e){
@@ -2105,24 +2108,25 @@ function buildAndUpload(show){
     return;
   }
   var body = frameWithHeader(payload);
-  /* R1.3.3：彩色 JPEG 缩略图随帧上传。网页端从 RGB 合成图生成（画质远好于
-     2bit 缩略），body = 整帧 + 缩略头 + JPEG；tlen=JPEG 字节数。
-     生成失败则不带缩略（固件图库接口回退实时抽稀）。 */
-  var url = api(show ? "/api/frame?save=1" : "/api/frame?save=1&noshow=1");
-  try {
-    var thumb = buildThumbJpeg();
-    var nb = new Uint8Array(body.length + thumb.length);
-    nb.set(body, 0); nb.set(thumb, body.length);
-    body = nb;
-    url += "&tlen=" + (thumb.length - 16);
-  } catch(e){ /* 缩略生成失败：不带缩略上传 */ }
+  /* R1.3.4（FB-018）：「上传并刷新屏幕」走无 save 的 /api/frame —— 只显示、
+     不占轮播槽、不擦写 flash；「上传到图库」才用 save=1&noshow=1。
+     R1.3.3 的彩色 JPEG 缩略只服务图库列表，不入库时不必生成与上传。 */
+  var url = api(doSave ? "/api/frame?save=1&noshow=1" : "/api/frame");
+  if (doSave) {
+    try {
+      var thumb = buildThumbJpeg();
+      var nb = new Uint8Array(body.length + thumb.length);
+      nb.set(body, 0); nb.set(thumb, body.length);
+      body = nb;
+      url += "&tlen=" + (thumb.length - 16);
+    } catch(e){ /* 缩略生成失败：不带缩略上传，图库回退实时抽稀 */ }
+  }
   msg("正在上传 " + (body.length/1024).toFixed(0) + " KB…", "");
   updateWorkLoading("正在上传… 0%");
   setBar(0);
   var xhr = new XMLHttpRequest();
-  /* R1.3.1：上传 = 添加到轮播。show=true 用 save=1（存槽并显示），
-     show=false 用 save=1&noshow=1（仅存槽不刷屏，供「仅上传」按钮）；
-     轮播满 8 张时固件回 507 */
+  /* R1.3.4（FB-018）：doSave=true 才入库（save=1&noshow=1），
+     否则只刷新不占槽；入库时轮播满 8 张固件回 507 */
   xhr.open("POST", url);
   xhr.timeout = 30000;   /* R1.0.22：软超时，弱信号下不挂死 */
   xhr.ontimeout = function(){
@@ -2143,8 +2147,12 @@ function buildAndUpload(show){
     hideWorkLoading();
     barEl.style.display = "none";
     if (xhr.status === 200){
-      msg(show ? "已存入轮播，屏幕刷新中…" : "已存入轮播（未刷屏），图库已更新", "ok");
-      refreshGallery();
+      if (doSave){
+        msg("已存入图库（未刷新屏幕），双击设备按键可循环播放", "ok");
+        refreshGallery();
+      } else {
+        msg("屏幕刷新中…（未加入图库、不占槽位）", "ok");
+      }
     } else if (xhr.status === 507){
       msg("轮播已满 8 张：请先删除或清空再上传", "err");
       refreshGallery();
